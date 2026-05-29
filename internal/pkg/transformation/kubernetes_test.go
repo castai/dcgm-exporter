@@ -31,6 +31,7 @@ import (
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
 	v1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
@@ -635,54 +636,81 @@ func TestPodDRAInfo(t *testing.T) {
 		}},
 	}
 
+	strPtr := func(s string) *string { return &s }
+
 	tests := []struct {
-		name         string
-		deviceToUUID map[string]string
-		migDevices   map[string]*DRAMigDeviceInfo
-		wantUUIDs    []string
-		isMIG        bool
+		name      string
+		slices    []runtime.Object
+		wantUUIDs []string
+		isMIG     bool
 	}{
 		{
-			name:         "uuid-exists",
-			deviceToUUID: map[string]string{"poolA/gpu-x": "GPU-8a748984-0fe7-297f-916c-4b998ce202d1"},
-			migDevices:   map[string]*DRAMigDeviceInfo{},
-			wantUUIDs:    []string{"GPU-8a748984-0fe7-297f-916c-4b998ce202d1"},
-			isMIG:        false,
-		},
-		{
-			name:         "uuid-updated",
-			deviceToUUID: map[string]string{"poolA/gpu-x": "GPU-UUID-Updated"},
-			migDevices:   map[string]*DRAMigDeviceInfo{},
-			wantUUIDs:    []string{"GPU-UUID-Updated"},
-			isMIG:        false,
-		},
-		{
-			name:         "no-uuid",
-			deviceToUUID: map[string]string{},
-			migDevices:   map[string]*DRAMigDeviceInfo{},
-			wantUUIDs:    nil,
-			isMIG:        false,
-		},
-		{
-			name:         "mig-device",
-			deviceToUUID: map[string]string{"poolA/gpu-x": "MIG-12345"},
-			migDevices: map[string]*DRAMigDeviceInfo{
-				"poolA/gpu-x": {
-					MIGDeviceUUID: "MIG-12345",
-					Profile:       "1g.12gb",
-					ParentUUID:    "GPU-parent-uuid",
+			name: "uuid-exists",
+			slices: []runtime.Object{
+				&resourcev1.ResourceSlice{
+					ObjectMeta: metav1.ObjectMeta{Name: "s1"},
+					Spec: resourcev1.ResourceSliceSpec{
+						Driver:  DRAGPUDriverName,
+						Pool:    resourcev1.ResourcePool{Name: "poolA"},
+						Devices: []resourcev1.Device{{Name: "gpu-x", Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{"type": {StringValue: strPtr("gpu")}, "uuid": {StringValue: strPtr("GPU-8a748984-0fe7-297f-916c-4b998ce202d1")}}}},
+					},
 				},
 			},
-			wantUUIDs: []string{"GPU-parent-uuid"}, // Should map to parent UUID
+			wantUUIDs: []string{"GPU-8a748984-0fe7-297f-916c-4b998ce202d1"},
+			isMIG:     false,
+		},
+		{
+			name: "uuid-updated",
+			slices: []runtime.Object{
+				&resourcev1.ResourceSlice{
+					ObjectMeta: metav1.ObjectMeta{Name: "s2"},
+					Spec: resourcev1.ResourceSliceSpec{
+						Driver:  DRAGPUDriverName,
+						Pool:    resourcev1.ResourcePool{Name: "poolA"},
+						Devices: []resourcev1.Device{{Name: "gpu-x", Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{"type": {StringValue: strPtr("gpu")}, "uuid": {StringValue: strPtr("GPU-UUID-Updated")}}}},
+					},
+				},
+			},
+			wantUUIDs: []string{"GPU-UUID-Updated"},
+			isMIG:     false,
+		},
+		{
+			name:      "no-uuid",
+			slices:    nil,
+			wantUUIDs: nil,
+			isMIG:     false,
+		},
+		{
+			name: "mig-device",
+			slices: []runtime.Object{
+				&resourcev1.ResourceSlice{
+					ObjectMeta: metav1.ObjectMeta{Name: "s3"},
+					Spec: resourcev1.ResourceSliceSpec{
+						Driver: DRAGPUDriverName,
+						Pool:   resourcev1.ResourcePool{Name: "poolA"},
+						Devices: []resourcev1.Device{{Name: "gpu-x", Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"type":       {StringValue: strPtr("mig")},
+							"uuid":       {StringValue: strPtr("MIG-12345")},
+							"profile":    {StringValue: strPtr("1g.12gb")},
+							"parentUUID": {StringValue: strPtr("GPU-parent-uuid")},
+						}}},
+					},
+				},
+			},
+			wantUUIDs: []string{"GPU-parent-uuid"},
 			isMIG:     true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			inf := newTestInformerForDRA()
+			for _, s := range tc.slices {
+				require.NoError(t, inf.Add(s))
+			}
 			draMgr := &DRAResourceSliceManager{
-				deviceToUUID: tc.deviceToUUID,
-				migDevices:   tc.migDevices,
+				informer:        inf,
+				sliceAPIVersion: "v1",
 			}
 
 			pm := &PodMapper{
