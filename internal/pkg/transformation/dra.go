@@ -17,117 +17,70 @@
 package transformation
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
 
 	resourcev1 "k8s.io/api/resource/v1"
 	resourcev1beta1 "k8s.io/api/resource/v1beta1"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	resourcelistersv1 "k8s.io/client-go/listers/resource/v1"
+	resourcelistersv1beta1 "k8s.io/client-go/listers/resource/v1beta1"
 	"k8s.io/client-go/tools/cache"
-	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 
 	"github.com/NVIDIA/dcgm-exporter/internal/pkg/kubeclient"
 )
 
 const (
 	informerResyncPeriod = 10 * time.Minute
+
+	resourceSliceCacheSyncTimeout = 30 * time.Second
 )
 
-type resourceSliceAdapter interface {
-	GetDevices() []deviceAdapter
-}
+type resourceSliceAPIVersion int
 
-type deviceAdapter interface {
-	GetName() string
-	GetAttribute(key string) string
-	HasAttributes() bool
-}
+const (
+	resourceSliceAPIUnknown resourceSliceAPIVersion = iota
+	resourceSliceAPIV1
+	resourceSliceAPIV1beta1
+)
 
-type v1ResourceSliceAdapter struct {
-	slice *resourcev1.ResourceSlice
-}
-
-func (a *v1ResourceSliceAdapter) GetDevices() []deviceAdapter {
-	devices := make([]deviceAdapter, len(a.slice.Spec.Devices))
-	for i := range a.slice.Spec.Devices {
-		devices[i] = &v1DeviceAdapter{device: &a.slice.Spec.Devices[i]}
+func (v resourceSliceAPIVersion) String() string {
+	switch v {
+	case resourceSliceAPIV1:
+		return resourcev1.SchemeGroupVersion.String()
+	case resourceSliceAPIV1beta1:
+		return resourcev1beta1.SchemeGroupVersion.String()
+	default:
+		return "unknown"
 	}
-	return devices
 }
 
-type v1DeviceAdapter struct {
-	device *resourcev1.Device
-}
-
-func (a *v1DeviceAdapter) GetName() string {
-	return a.device.Name
-}
-
-func (a *v1DeviceAdapter) HasAttributes() bool {
-	return a.device.Attributes != nil
-}
-
-func (a *v1DeviceAdapter) GetAttribute(key string) string {
-	if a.device.Attributes == nil {
-		return ""
+func detectResourceSliceAPIVersion(client kubernetes.Interface) resourceSliceAPIVersion {
+	apiVersion := []struct {
+		groupVersion string
+		version      resourceSliceAPIVersion
+	}{
+		{resourcev1.SchemeGroupVersion.WithResource("resourceslices").GroupVersion().String(), resourceSliceAPIV1},
+		{resourcev1beta1.SchemeGroupVersion.WithResource("resourceslices").GroupVersion().String(), resourceSliceAPIV1beta1},
 	}
-	attrKey := resourcev1.QualifiedName(key)
-	if attr, ok := a.device.Attributes[attrKey]; ok && attr.StringValue != nil {
-		return *attr.StringValue
-	}
-	return ""
-}
 
-type v1beta1ResourceSliceAdapter struct {
-	slice *resourcev1beta1.ResourceSlice
-}
-
-func (a *v1beta1ResourceSliceAdapter) GetDevices() []deviceAdapter {
-	devices := make([]deviceAdapter, len(a.slice.Spec.Devices))
-	for i := range a.slice.Spec.Devices {
-		devices[i] = &v1beta1DeviceAdapter{device: &a.slice.Spec.Devices[i]}
-	}
-	return devices
-}
-
-type v1beta1DeviceAdapter struct {
-	device *resourcev1beta1.Device
-}
-
-func (a *v1beta1DeviceAdapter) GetName() string {
-	return a.device.Name
-}
-
-func (a *v1beta1DeviceAdapter) HasAttributes() bool {
-	return a.device.Basic != nil && a.device.Basic.Attributes != nil
-}
-
-func (a *v1beta1DeviceAdapter) GetAttribute(key string) string {
-	if a.device.Basic == nil || a.device.Basic.Attributes == nil {
-		return ""
-	}
-	attrKey := resourcev1beta1.QualifiedName(key)
-	if attr, ok := a.device.Basic.Attributes[attrKey]; ok && attr.StringValue != nil {
-		return *attr.StringValue
-	}
-	return ""
-}
-
-func supportsResourceSliceGV(client kubernetes.Interface, groupVersion string) bool {
-	resources, err := client.Discovery().ServerResourcesForGroupVersion(groupVersion)
-	if err != nil {
-		slog.Warn("Discovery failed for groupVersion", "groupVersion", groupVersion, "error", err)
-		return false
-	}
-	for _, r := range resources.APIResources {
-		if r.Name == "resourceslices" {
-			return true
+	for _, a := range apiVersion {
+		resources, err := client.Discovery().ServerResourcesForGroupVersion(a.groupVersion)
+		if err != nil {
+			slog.Debug("ResourceSlice discovery failed", "groupVersion", a.groupVersion, "error", err)
+			continue
+		}
+		for _, r := range resources.APIResources {
+			if r.Name == "resourceslices" {
+				return a.version
+			}
 		}
 	}
-	return false
+	return resourceSliceAPIUnknown
 }
 
 func NewDRAResourceSliceManager() (*DRAResourceSliceManager, error) {
@@ -136,193 +89,157 @@ func NewDRAResourceSliceManager() (*DRAResourceSliceManager, error) {
 		return nil, fmt.Errorf("error getting kube client: %w", err)
 	}
 
-	const (
-		resourceGVV1      = "resource.k8s.io/v1"
-		resourceGVV1beta1 = "resource.k8s.io/v1beta1"
-	)
-
-	v1Served := supportsResourceSliceGV(client, resourceGVV1)
-	v1beta1Served := supportsResourceSliceGV(client, resourceGVV1beta1)
-	if !v1Served && !v1beta1Served {
-		slog.Warn("Neither resource.k8s.io/v1 nor v1beta1 ResourceSlice API is served; DRA labels will not be available")
-		return nil, nil
-	}
-
-	// Prefer v1 when served; fall back to v1beta1.
-	var selected string
-	switch {
-	case v1Served:
-		selected = "v1"
-	case v1beta1Served:
-		selected = "v1beta1"
+	apiVersion := detectResourceSliceAPIVersion(client)
+	if apiVersion == resourceSliceAPIUnknown {
+		return nil, fmt.Errorf("ResourceSlice API not served by cluster (looked for %s and %s)",
+			resourcev1.SchemeGroupVersion, resourcev1beta1.SchemeGroupVersion)
 	}
 
 	factory := informers.NewSharedInformerFactory(client, informerResyncPeriod)
 
-	var informer cache.SharedIndexInformer
-	switch selected {
-	case "v1":
-		informer = factory.Resource().V1().ResourceSlices().Informer()
-		err = informer.AddIndexers(cache.Indexers{
-			"poolName": func(obj interface{}) ([]string, error) {
-				rs, ok := obj.(*resourcev1.ResourceSlice)
-				if !ok {
-					return nil, nil
-				}
-				return []string{rs.Spec.Pool.Name}, nil
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("error adding pool indexer to v1 ResourceSlice informer: %w", err)
-		}
-	case "v1beta1":
-		informer = factory.Resource().V1beta1().ResourceSlices().Informer()
-		err = informer.AddIndexers(cache.Indexers{
-			"poolName": func(obj interface{}) ([]string, error) {
-				rs, ok := obj.(*resourcev1beta1.ResourceSlice)
-				if !ok {
-					return nil, nil
-				}
-				return []string{rs.Spec.Pool.Name}, nil
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("error adding pool indexer to v1beta1 ResourceSlice informer: %w", err)
-		}
+	m := &DRAResourceSliceManager{factory: factory}
+
+	var hasSynced cache.InformerSynced
+	switch apiVersion {
+	case resourceSliceAPIV1:
+		informer := factory.Resource().V1().ResourceSlices().Informer()
+		lister := factory.Resource().V1().ResourceSlices().Lister()
+		m.lookup = makeV1Lookup(lister)
+		hasSynced = informer.HasSynced
+	case resourceSliceAPIV1beta1:
+		informer := factory.Resource().V1beta1().ResourceSlices().Informer()
+		lister := factory.Resource().V1beta1().ResourceSlices().Lister()
+		m.lookup = makeV1beta1Lookup(lister)
+		hasSynced = informer.HasSynced
 	}
 
-	m := &DRAResourceSliceManager{
-		informer:        informer,
-		sliceAPIVersion: selected,
-	}
+	slog.Info("Using ResourceSlice API", "groupVersion", apiVersion.String())
 
-	factory.Start(wait.NeverStop)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelContext = cancel
+	factory.Start(ctx.Done())
 
-	synced := cache.WaitForCacheSync(wait.NeverStop, informer.HasSynced)
-	if !synced {
-		factory.Shutdown()
+	syncCtx, syncCancel := context.WithTimeout(ctx, resourceSliceCacheSyncTimeout)
+	defer syncCancel()
+	if !cache.WaitForCacheSync(syncCtx.Done(), hasSynced) {
+		cancel()
+		if syncCtx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("ResourceSlice informer cache sync timed out after %s "+
+				"(check RBAC: list/watch on resource.k8s.io/resourceslices)", resourceSliceCacheSyncTimeout)
+		}
 		return nil, fmt.Errorf("ResourceSlice informer cache sync failed")
 	}
-
-	slog.Info("ResourceSlice API informer synced successfully", "apiVersion", selected)
 	return m, nil
 }
 
-func lookupDRADeviceInAdapter(pool, device string, adapter resourceSliceAdapter) (string, *DRAMigDeviceInfo) {
-	for _, dev := range adapter.GetDevices() {
-		if !dev.HasAttributes() {
-			continue
-		}
-		if dev.GetName() != device {
-			continue
-		}
-
-		deviceType := dev.GetAttribute("type")
-		switch deviceType {
-		case "mig":
-			parentUUID := dev.GetAttribute("parentUUID")
-			profile := dev.GetAttribute("profile")
-			migUUID := dev.GetAttribute("uuid")
-			if parentUUID != "" {
-				migInfo := &DRAMigDeviceInfo{
-					MIGDeviceUUID: migUUID,
-					Profile:       profile,
-					ParentUUID:    parentUUID,
-				}
-				slog.Debug("Found MIG device", "pool", pool, "device", device, "parentUUID", parentUUID)
-				return parentUUID, migInfo
-			}
-		case "gpu":
-			uuid := dev.GetAttribute("uuid")
-			if uuid != "" {
-				slog.Debug("Found GPU device", "pool", pool, "device", device, "uuid", uuid)
-				return uuid, nil
-			}
-		default:
-			slog.Warn("Device has unknown type", "pool", pool, "device", device, "type", deviceType)
-		}
+func (m *DRAResourceSliceManager) Stop() {
+	if m.cancelContext != nil {
+		m.cancelContext()
 	}
-	return "", nil
+	if m.factory != nil {
+		m.factory.Shutdown()
+	}
 }
 
-// GetDeviceInfo queries the informer cache directly using a type-switch over
-// the stored objects, avoiding version-specific helper methods.
 func (m *DRAResourceSliceManager) GetDeviceInfo(pool, device string) (string, *DRAMigDeviceInfo) {
-	if m.informer == nil {
+	if m.lookup == nil {
 		return "", nil
 	}
+	return m.lookup(pool, device)
+}
 
-	items, err := m.informer.GetIndexer().ByIndex("poolName", pool)
-	if err != nil {
-		slog.Error("Error listing ResourceSlices by pool index", "pool", pool, "error", err)
+type deviceLookupFunc func(pool, device string) (string, *DRAMigDeviceInfo)
+
+func makeV1Lookup(lister resourcelistersv1.ResourceSliceLister) deviceLookupFunc {
+	return func(pool, device string) (string, *DRAMigDeviceInfo) {
+		slices, err := lister.List(labels.Everything())
+		if err != nil {
+			slog.Debug("listing v1 ResourceSlices failed", "error", err)
+			return "", nil
+		}
+		for _, s := range slices {
+			if s.Spec.Driver != DRAGPUDriverName || s.Spec.Pool.Name != pool {
+				continue
+			}
+			for _, d := range s.Spec.Devices {
+				if d.Name != device {
+					continue
+				}
+				if d.Attributes == nil {
+					return "", nil
+				}
+				return buildDeviceMapping(
+					getV1AttrString(d.Attributes, "type"),
+					getV1AttrString(d.Attributes, "uuid"),
+					getV1AttrString(d.Attributes, "parentUUID"),
+					getV1AttrString(d.Attributes, "profile"),
+				)
+			}
+		}
 		return "", nil
 	}
-
-	for _, item := range items {
-		var adapter resourceSliceAdapter
-		var driver string
-		switch rs := item.(type) {
-		case *resourcev1.ResourceSlice:
-			driver, adapter = rs.Spec.Driver, &v1ResourceSliceAdapter{slice: rs}
-		case *resourcev1beta1.ResourceSlice:
-			driver, adapter = rs.Spec.Driver, &v1beta1ResourceSliceAdapter{slice: rs}
-		default:
-			continue
-		}
-		if driver != DRAGPUDriverName {
-			continue
-		}
-		if mappingKey, migInfo := lookupDRADeviceInAdapter(pool, device, adapter); mappingKey != "" {
-			return mappingKey, migInfo
-		}
-	}
-
-	slog.Debug("No UUID found for DRA device", "pool", pool, "device", device)
-	return "", nil
 }
 
-type DynamicResourceMapping struct {
-	MappingKey string
-	Info       *DynamicResourceInfo
+func makeV1beta1Lookup(lister resourcelistersv1beta1.ResourceSliceLister) deviceLookupFunc {
+	return func(pool, device string) (string, *DRAMigDeviceInfo) {
+		slices, err := lister.List(labels.Everything())
+		if err != nil {
+			slog.Debug("listing v1beta1 ResourceSlices failed", "error", err)
+			return "", nil
+		}
+		for _, s := range slices {
+			if s.Spec.Driver != DRAGPUDriverName || s.Spec.Pool.Name != pool {
+				continue
+			}
+			for _, d := range s.Spec.Devices {
+				if d.Name != device {
+					continue
+				}
+				if d.Basic == nil || d.Basic.Attributes == nil {
+					return "", nil
+				}
+				return buildDeviceMapping(
+					getV1beta1AttrString(d.Basic.Attributes, "type"),
+					getV1beta1AttrString(d.Basic.Attributes, "uuid"),
+					getV1beta1AttrString(d.Basic.Attributes, "parentUUID"),
+					getV1beta1AttrString(d.Basic.Attributes, "profile"),
+				)
+			}
+		}
+		return "", nil
+	}
 }
 
-func (m *DRAResourceSliceManager) GetDynamicResourceMappings(resource *podresourcesapi.DynamicResource) []DynamicResourceMapping {
-	if resource == nil {
-		return nil
+func buildDeviceMapping(deviceType, uuid, parentUUID, profile string) (string, *DRAMigDeviceInfo) {
+	switch deviceType {
+	case "gpu":
+		return uuid, nil
+	case "mig":
+		if parentUUID == "" {
+			slog.Debug("MIG device missing parent UUID", "uuid", uuid)
+			return "", nil
+		}
+		return parentUUID, &DRAMigDeviceInfo{
+			MIGDeviceUUID: uuid,
+			Profile:       profile,
+			ParentUUID:    parentUUID,
+		}
+	default:
+		slog.Debug("Unknown DRA device type", "type", deviceType)
+		return "", nil
 	}
+}
 
-	mappings := make([]DynamicResourceMapping, 0, len(resource.GetClaimResources()))
-	for _, claimResource := range resource.GetClaimResources() {
-		draDriverName := claimResource.GetDriverName()
-		if draDriverName != DRAGPUDriverName {
-			continue
-		}
-
-		draPoolName := claimResource.GetPoolName()
-		draDeviceName := claimResource.GetDeviceName()
-
-		mappingKey, migInfo := m.GetDeviceInfo(draPoolName, draDeviceName)
-		if mappingKey == "" {
-			slog.Debug("No UUID for DRA claim resource", "pool", draPoolName, "device", draDeviceName)
-			continue
-		}
-
-		drInfo := &DynamicResourceInfo{
-			ClaimName:      resource.GetClaimName(),
-			ClaimNamespace: resource.GetClaimNamespace(),
-			DriverName:     draDriverName,
-			PoolName:       draPoolName,
-			DeviceName:     draDeviceName,
-		}
-		if migInfo != nil {
-			drInfo.MIGInfo = migInfo
-		}
-
-		mappings = append(mappings, DynamicResourceMapping{
-			MappingKey: mappingKey,
-			Info:       drInfo,
-		})
+func getV1AttrString(attrs map[resourcev1.QualifiedName]resourcev1.DeviceAttribute, key resourcev1.QualifiedName) string {
+	if attr, ok := attrs[key]; ok && attr.StringValue != nil {
+		return *attr.StringValue
 	}
+	return ""
+}
 
-	return mappings
+func getV1beta1AttrString(attrs map[resourcev1beta1.QualifiedName]resourcev1beta1.DeviceAttribute, key resourcev1beta1.QualifiedName) string {
+	if attr, ok := attrs[key]; ok && attr.StringValue != nil {
+		return *attr.StringValue
+	}
+	return ""
 }

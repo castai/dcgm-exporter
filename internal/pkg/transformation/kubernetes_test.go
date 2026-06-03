@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	resourcelistersv1 "k8s.io/client-go/listers/resource/v1"
 	"k8s.io/client-go/tools/cache"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 
@@ -704,13 +705,13 @@ func TestPodDRAInfo(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			inf := newTestInformerForDRA()
+			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 			for _, s := range tc.slices {
-				require.NoError(t, inf.Add(s))
+				require.NoError(t, indexer.Add(s))
 			}
+			lister := resourcelistersv1.NewResourceSliceLister(indexer)
 			draMgr := &DRAResourceSliceManager{
-				informer:        inf,
-				sliceAPIVersion: "v1",
+				lookup: makeV1Lookup(lister),
 			}
 
 			pm := &PodMapper{
@@ -729,7 +730,7 @@ func TestPodDRAInfo(t *testing.T) {
 				}},
 			}
 
-			got := pm.toDeviceToPodsDRA(resp)
+			got := pm.toDeviceToPodsDRA(resp, nil)
 
 			assert.Len(t, got, len(tc.wantUUIDs), "map size")
 			for _, want := range tc.wantUUIDs {

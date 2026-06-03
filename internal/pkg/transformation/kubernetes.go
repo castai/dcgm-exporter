@@ -322,7 +322,7 @@ func (p *PodMapper) getMappings(deviceInfo deviceinfo.Provider) (map[string][]Po
 	} else {
 		deviceToPod = p.toDeviceToPod(pods, deviceInfo)
 		if p.Config.KubernetesEnableDRA {
-			deviceToPodsDRA = p.toDeviceToPodsDRA(pods)
+			deviceToPodsDRA = p.toDeviceToPodsDRA(pods, deviceInfo)
 		}
 	}
 
@@ -561,7 +561,7 @@ func stripVGPUSuffix(deviceID string) string {
 	return deviceID
 }
 
-func (p *PodMapper) toDeviceToPodsDRA(devicePods *podresourcesapi.ListPodResourcesResponse) map[string][]PodInfo {
+func (p *PodMapper) toDeviceToPodsDRA(devicePods *podresourcesapi.ListPodResourcesResponse, deviceInfo deviceinfo.Provider) map[string][]PodInfo {
 	deviceToPodsMap := make(map[string][]PodInfo)
 	if p.ResourceSliceManager == nil {
 		return deviceToPodsMap
@@ -572,26 +572,71 @@ func (p *PodMapper) toDeviceToPodsDRA(devicePods *podresourcesapi.ListPodResourc
 	for _, pod := range devicePods.GetPodResources() {
 		for _, container := range pod.GetContainers() {
 			for _, dr := range container.GetDynamicResources() {
-				mappings := p.ResourceSliceManager.GetDynamicResourceMappings(dr)
-				for _, m := range mappings {
-					podContainerKey := pod.GetName() + "/" + pod.GetNamespace() + "/" + container.GetName()
-					if processedPods[m.MappingKey] == nil {
-						processedPods[m.MappingKey] = make(map[string]bool)
-					}
-					if processedPods[m.MappingKey][podContainerKey] {
+				for _, claimResource := range dr.GetClaimResources() {
+					if claimResource.GetDriverName() != DRAGPUDriverName {
 						continue
 					}
+					for _, device := range claimResource.GetCdiDevices() {
+						pool := claimResource.GetPoolName()
+						deviceName := claimResource.GetDeviceName()
 
-					podInfo := p.createPodInfo(pod, container)
-					podInfo.DynamicResources = m.Info
-					deviceToPodsMap[m.MappingKey] = append(deviceToPodsMap[m.MappingKey], podInfo)
-					processedPods[m.MappingKey][podContainerKey] = true
+						mappingKey, migInfo := p.ResourceSliceManager.GetDeviceInfo(pool, deviceName)
+						if mappingKey == "" {
+							slog.Debug("Could not resolve DRA device", "pool", pool, "device", deviceName, "cdi", device)
+							continue
+						}
+
+						draMappingKeys := []string{mappingKey}
+						if migInfo != nil {
+							if giID := draMIGGPUInstanceIdentifier(deviceInfo, migInfo); giID != "" {
+								draMappingKeys = append(draMappingKeys, giID)
+							}
+						}
+
+						podContainerKey := pod.GetName() + "/" + pod.GetNamespace() + "/" + container.GetName()
+						for _, key := range draMappingKeys {
+							if processedPods[key] == nil {
+								processedPods[key] = make(map[string]bool)
+							}
+							if processedPods[key][podContainerKey] {
+								continue
+							}
+
+							podInfo := p.createPodInfo(pod, container)
+							podInfo.DynamicResources = &DynamicResourceInfo{
+								ClaimName:      dr.GetClaimName(),
+								ClaimNamespace: dr.GetClaimNamespace(),
+								DriverName:     claimResource.GetDriverName(),
+								PoolName:       pool,
+								DeviceName:     deviceName,
+								MIGInfo:        migInfo,
+							}
+							deviceToPodsMap[key] = append(deviceToPodsMap[key], podInfo)
+							processedPods[key][podContainerKey] = true
+						}
+					}
 				}
 			}
 		}
 	}
 
 	return deviceToPodsMap
+}
+
+func draMIGGPUInstanceIdentifier(deviceInfo deviceinfo.Provider, migInfo *DRAMigDeviceInfo) string {
+	if deviceInfo == nil || migInfo == nil || migInfo.MIGDeviceUUID == "" {
+		return ""
+	}
+	migDevice, err := nvmlprovider.Client().GetMIGDeviceInfoByID(migInfo.MIGDeviceUUID)
+	if err != nil {
+		slog.Debug("Failed to get MIG device info for DRA device", "uuid", migInfo.MIGDeviceUUID, "error", err)
+		return ""
+	}
+	if migDevice.GPUInstanceID < 0 {
+		return ""
+	}
+	return deviceinfo.GetGPUInstanceIdentifier(deviceInfo, migDevice.ParentUUID,
+		uint(migDevice.GPUInstanceID)) //nolint:gosec // G115: bounds checked above
 }
 
 // toDeviceToSharingPods uses the same general logic as toDeviceToPod but
@@ -650,7 +695,7 @@ func (p *PodMapper) toDeviceToSharingPods(devicePods *podresourcesapi.ListPodRes
 
 	// Also include DRA-managed GPU devices so they get per-process metrics
 	if p.Config.KubernetesEnableDRA && p.ResourceSliceManager != nil {
-		draMappings := p.toDeviceToPodsDRA(devicePods)
+		draMappings := p.toDeviceToPodsDRA(devicePods, deviceInfo)
 		for gpuUUID, podInfos := range draMappings {
 			deviceToPodsMap[gpuUUID] = append(deviceToPodsMap[gpuUUID], podInfos...)
 		}

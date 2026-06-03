@@ -137,6 +137,10 @@ func NewMetricsServer(
 		if podMapper != nil {
 			slog.Info("Stopping PodMapper")
 			podMapper.Stop()
+			if podMapper.ResourceSliceManager != nil {
+				slog.Info("Stopping DRA ResourceSlice manager")
+				podMapper.ResourceSliceManager.Stop()
+			}
 		}
 	}
 

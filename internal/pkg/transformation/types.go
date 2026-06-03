@@ -18,6 +18,7 @@ package transformation
 
 import (
 	"container/list"
+	"context"
 	"regexp"
 	"sync"
 
@@ -76,8 +77,9 @@ type PodInfo struct {
 }
 
 type DRAResourceSliceManager struct {
-	informer        cache.SharedIndexInformer
-	sliceAPIVersion string
+	factory       informers.SharedInformerFactory
+	cancelContext context.CancelFunc
+	lookup        deviceLookupFunc
 }
 
 type DynamicResourceInfo struct {
