@@ -457,6 +457,13 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 		if deviceToPodsDRA != nil {
 			slog.Debug(fmt.Sprintf("Device to pod mapping for DRA: %+v", deviceToPodsDRA))
 
+			gpuUUIDToDeviceID := getGPUUUIDToDeviceID(deviceInfo, p.Config.KubernetesGPUIdType)
+			draProcessCollector := &perProcessCollector{
+				client:    nvmlprovider.Client(),
+				pidMapper: newPIDToPodMapper(),
+			}
+			draPerProcessData := draProcessCollector.Collect(gpuUUIDToDeviceID, deviceToPodsDRA, deviceInfo)
+
 			for counter := range metrics {
 				var newmetrics []collector.Metric
 				for j, val := range metrics[counter] {
@@ -467,6 +474,17 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 
 					podInfos := deviceToPodsDRA[deviceID]
 					if podInfos != nil {
+						if isPerProcessMetric(counter.FieldName) {
+							perProcessMetrics, err := p.createPerProcessMetrics(val, counter, metrics[counter][j], draPerProcessData)
+							if err != nil {
+								return err
+							}
+							if perProcessMetrics != nil {
+								newmetrics = append(newmetrics, metrics[counter][j])
+								newmetrics = append(newmetrics, perProcessMetrics...)
+								continue
+							}
+						}
 						for _, pi := range podInfos {
 							metric, err := utils.DeepCopy(metrics[counter][j])
 							if err != nil {
