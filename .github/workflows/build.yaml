@@ -48,7 +48,7 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          target: runtime-ubuntu
+          target: runtime-distroless
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ghcr.io/castai/dcgm-exporter:${{ github.sha }}
@@ -62,7 +62,7 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          target: runtime-ubuntu
+          target: runtime-distroless
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ghcr.io/castai/dcgm-exporter:${{ github.sha }}
@@ -76,7 +76,7 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          target: runtime-ubuntu
+          target: runtime-distroless
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
