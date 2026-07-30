@@ -562,6 +562,9 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 					}
 
 					podInfos := deviceToPodsDRA[deviceID]
+					if podInfos == nil {
+						podInfos = deviceToPodsDRA[val.GPUUUID]
+					}
 					if podInfos != nil {
 						if isPerProcessMetric(counter.FieldName) {
 							perProcessMetrics, err := p.createPerProcessMetrics(val, counter, metrics[counter][j], draPerProcessData, getMetricGroup)
@@ -965,8 +968,14 @@ func (p *PodMapper) toDeviceToSharingPods(devicePods *podresourcesapi.ListPodRes
 	// when virtualGPUs is enabled.
 	if p.Config.KubernetesEnableDRA && p.ResourceSliceManager != nil {
 		draMappings := p.toDeviceToPodsDRA(devicePods, deviceInfo)
+		gpuUUIDToDeviceID := getGPUUUIDToDeviceID(deviceInfo, p.Config.KubernetesGPUIdType)
 		for gpuUUID, podInfos := range draMappings {
 			deviceToPodsMap[gpuUUID] = append(deviceToPodsMap[gpuUUID], podInfos...)
+			// Also map under the device-name key (e.g. "nvidia0") so that
+			// metric lookups using GetIDOfType(device-name) find DRA pods.
+			if deviceID, ok := gpuUUIDToDeviceID[gpuUUID]; ok {
+				deviceToPodsMap[deviceID] = append(deviceToPodsMap[deviceID], podInfos...)
+			}
 		}
 	}
 
