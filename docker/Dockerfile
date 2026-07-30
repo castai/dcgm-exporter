@@ -319,6 +319,9 @@ COPY --from=runtime-distroless-helper --chown=root:root --chmod=644 /etc/group /
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,compat32
 ENV NVIDIA_DISABLE_REQUIRE="true"
 ENV NVIDIA_VISIBLE_DEVICES=all
+# Override distroless base's LD_LIBRARY_PATH to include DCGM library paths
+# so DCGM can dlopen libnvperf_host.so for profiling metrics.
+ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib/x86_64-linux-gnu:/lib/aarch64-linux-gnu:/lib/distroless/
 
 # Security Note: Default USER
 #
