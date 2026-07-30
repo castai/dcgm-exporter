@@ -301,6 +301,7 @@ func (p *PodMapper) createPerProcessMetrics(
 		if podInfo.VGPU != "" {
 			metric.Attributes[vgpuAttribute] = podInfo.VGPU
 		}
+		setDRAAttributes(metric.Attributes, podInfo.DynamicResources)
 		if len(podInfo.Labels) > 0 {
 			copyPodLabels(&metric, podInfo.Labels, getMetricGroup())
 		}
@@ -477,6 +478,7 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 					if pi.VGPU != "" {
 						metric.Attributes[vgpuAttribute] = pi.VGPU
 					}
+					setDRAAttributes(metric.Attributes, pi.DynamicResources)
 					if len(pi.Labels) > 0 {
 						copyPodLabels(&metric, pi.Labels, getMetricGroup())
 					}
@@ -562,7 +564,7 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 					podInfos := deviceToPodsDRA[deviceID]
 					if podInfos != nil {
 						if isPerProcessMetric(counter.FieldName) {
-							perProcessMetrics, err := p.createPerProcessMetrics(val, counter, metrics[counter][j], draPerProcessData)
+							perProcessMetrics, err := p.createPerProcessMetrics(val, counter, metrics[counter][j], draPerProcessData, getMetricGroup)
 							if err != nil {
 								return err
 							}
@@ -586,18 +588,7 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 								metric.Attributes[oldNamespaceAttribute] = pi.Namespace
 								metric.Attributes[oldContainerAttribute] = pi.Container
 							}
-							if dr := pi.DynamicResources; dr != nil {
-								metric.Attributes[draClaimName] = dr.ClaimName
-								metric.Attributes[draClaimNamespace] = dr.ClaimNamespace
-								metric.Attributes[draDriverName] = dr.DriverName
-								metric.Attributes[draPoolName] = dr.PoolName
-								metric.Attributes[draDeviceName] = dr.DeviceName
-
-								if migInfo := dr.MIGInfo; migInfo != nil {
-									metric.Attributes[draMigProfile] = migInfo.Profile
-									metric.Attributes[draMigDeviceUUID] = migInfo.MIGDeviceUUID
-								}
-							}
+							setDRAAttributes(metric.Attributes, pi.DynamicResources)
 							if len(pi.Labels) > 0 {
 								copyPodLabels(&metric, pi.Labels, getMetricGroup())
 							}
@@ -621,6 +612,21 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 	}
 
 	return nil
+}
+
+func setDRAAttributes(attrs map[string]string, dr *DynamicResourceInfo) {
+	if dr == nil {
+		return
+	}
+	attrs[draClaimName] = dr.ClaimName
+	attrs[draClaimNamespace] = dr.ClaimNamespace
+	attrs[draDriverName] = dr.DriverName
+	attrs[draPoolName] = dr.PoolName
+	attrs[draDeviceName] = dr.DeviceName
+	if migInfo := dr.MIGInfo; migInfo != nil {
+		attrs[draMigProfile] = migInfo.Profile
+		attrs[draMigDeviceUUID] = migInfo.MIGDeviceUUID
+	}
 }
 
 func copyPodLabels(
@@ -954,6 +960,15 @@ func (p *PodMapper) toDeviceToSharingPods(devicePods *podresourcesapi.ListPodRes
 			deviceToPodsMap[deviceID] = append(deviceToPodsMap[deviceID], podInfo)
 		}
 	})
+
+	// Also include DRA-managed GPU devices so they get per-process metrics
+	// when virtualGPUs is enabled.
+	if p.Config.KubernetesEnableDRA && p.ResourceSliceManager != nil {
+		draMappings := p.toDeviceToPodsDRA(devicePods, deviceInfo)
+		for gpuUUID, podInfos := range draMappings {
+			deviceToPodsMap[gpuUUID] = append(deviceToPodsMap[gpuUUID], podInfos...)
+		}
+	}
 
 	return deviceToPodsMap
 }
