@@ -54,7 +54,8 @@ jobs:
           tags: ghcr.io/castai/dcgm-exporter:${{ github.sha }}
           build-args: |
             VERSION=${{ github.sha }}
-            GOLANG_VERSION=1.26.2
+            GOLANG_VERSION=1.26.4
+            DCGM_VERSION=4.6.0
 
       - name: Build and push main
         if: github.event_name == 'push'
@@ -68,7 +69,8 @@ jobs:
           tags: ghcr.io/castai/dcgm-exporter:${{ github.sha }}
           build-args: |
             VERSION=${{ github.sha }}
-            GOLANG_VERSION=1.26.2
+            GOLANG_VERSION=1.26.4
+            DCGM_VERSION=4.6.0
 
       - name: Build and push release
         if: github.event_name == 'release'
@@ -84,4 +86,5 @@ jobs:
             ghcr.io/castai/dcgm-exporter:latest
           build-args: |
             VERSION=${{ env.RELEASE_TAG }}
-            GOLANG_VERSION=1.26.2
+            GOLANG_VERSION=1.26.4
+            DCGM_VERSION=4.6.0
