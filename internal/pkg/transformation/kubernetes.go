@@ -977,11 +977,13 @@ func (p *PodMapper) toDeviceToSharingPods(devicePods *podresourcesapi.ListPodRes
 		draMappings := p.toDeviceToPodsDRA(devicePods, deviceInfo)
 		gpuUUIDToDeviceID := getGPUUUIDToDeviceID(deviceInfo, p.Config.KubernetesGPUIdType)
 		for gpuUUID, podInfos := range draMappings {
-			deviceToPodsMap[gpuUUID] = append(deviceToPodsMap[gpuUUID], podInfos...)
-			// Also map under the device-name key (e.g. "nvidia0") so that
-			// metric lookups using GetIDOfType(device-name) find DRA pods.
+			// Map DRA pods under the device-name key (e.g. "nvidia0") so that
+			// metric lookups using GetIDOfType(device-name) find them. This is
+			// the only key needed since Process() always uses GetIDOfType.
 			if deviceID, ok := gpuUUIDToDeviceID[gpuUUID]; ok {
 				deviceToPodsMap[deviceID] = append(deviceToPodsMap[deviceID], podInfos...)
+			} else {
+				deviceToPodsMap[gpuUUID] = append(deviceToPodsMap[gpuUUID], podInfos...)
 			}
 		}
 	}
