@@ -453,7 +453,13 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 						return err
 					}
 					if perProcessMetrics != nil {
-						newmetrics = append(newmetrics, metrics[counter][j]) // original device-level metric
+						// Emit the device-level aggregate metric when there are 0 pods
+						// (idle GPU) or 2+ pods (sharing). With exactly 1 pod, the
+						// per-pod value equals the device-level value, so skip the
+						// duplicate.
+						if len(podInfos) != 1 {
+							newmetrics = append(newmetrics, metrics[counter][j])
+						}
 						newmetrics = append(newmetrics, perProcessMetrics...)
 						continue
 					}
@@ -490,9 +496,10 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 
 					newmetrics = append(newmetrics, metric)
 				}
-				// Preserve the original device-level metric for GPUs not currently
-				// used by any pod, so they still appear in /metrics with value 0.
-				if len(podInfos) == 0 {
+				// Emit the device-level metric for idle GPUs (0 pods) or shared
+				// GPUs (2+ pods). With exactly 1 pod, skip the duplicate since
+				// the per-pod value equals the device-level value.
+				if len(podInfos) != 1 {
 					newmetrics = append(newmetrics, metrics[counter][j])
 				}
 			}
