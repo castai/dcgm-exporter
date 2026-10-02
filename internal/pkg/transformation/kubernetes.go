@@ -270,6 +270,9 @@ func (p *PodMapper) createPerProcessMetrics(
 	if len(devicePods) == 0 {
 		return nil, nil
 	}
+	if !needsPerProcessAttribution(devicePods) {
+		return nil, nil
+	}
 
 	data := dataMap.metrics[metricsKey]
 	podValues := buildPodValueMap(dataMap.pidToPod, data, counter.FieldName)
@@ -430,7 +433,7 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 			client:    nvmlprovider.Client(),
 			pidMapper: newPIDToPodMapper(),
 		}
-		perProcessData := processCollector.Collect(gpuUUIDToDeviceID, deviceToPods, deviceInfo)
+		perProcessData := processCollector.Collect(gpuUUIDToDeviceID, filterPerProcessCandidates(deviceToPods), deviceInfo)
 
 		for counter := range metrics {
 			var newmetrics []collector.Metric
@@ -453,13 +456,9 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 						return err
 					}
 					if perProcessMetrics != nil {
-						// Emit the device-level aggregate metric when there are 0 pods
-						// (idle GPU) or 2+ pods (sharing). With exactly 1 pod, the
-						// per-pod value equals the device-level value, so skip the
-						// duplicate.
-						if len(podInfos) != 1 {
-							newmetrics = append(newmetrics, metrics[counter][j])
-						}
+						// Keep the device-level metric: per-process values can
+						// differ from it even with one pod (e.g. 0 under MPS).
+						newmetrics = append(newmetrics, metrics[counter][j])
 						newmetrics = append(newmetrics, perProcessMetrics...)
 						continue
 					}
@@ -558,7 +557,7 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 				client:    nvmlprovider.Client(),
 				pidMapper: newPIDToPodMapper(),
 			}
-			draPerProcessData := draProcessCollector.Collect(gpuUUIDToDeviceID, deviceToPodsDRA, deviceInfo)
+			draPerProcessData := draProcessCollector.Collect(gpuUUIDToDeviceID, filterPerProcessCandidates(deviceToPodsDRA), deviceInfo)
 
 			for counter := range metrics {
 				var newmetrics []collector.Metric
