@@ -191,20 +191,26 @@ func (c *perProcessCollector) Collect(gpuDeviceMap map[string]string, deviceToPo
 }
 
 // needsPerProcessAttribution returns false when a single DRA pod owns the
-// device, whose device-level value then is the per-pod value. Pods are
-// compared by namespace and name, as the UID may not be populated yet.
+// device, whose device-level value then is the per-pod value.
 func needsPerProcessAttribution(pods []PodInfo) bool {
 	if len(pods) == 0 {
 		return false
 	}
-	first := pods[0]
 	for _, podInfo := range pods {
-		if podInfo.DynamicResources == nil ||
-			podInfo.Namespace != first.Namespace || podInfo.Name != first.Name {
+		if podInfo.DynamicResources == nil || !samePod(podInfo, pods[0]) {
 			return true
 		}
 	}
 	return false
+}
+
+// samePod compares pods by UID, falling back to namespace and name when a UID
+// is not populated yet (the informer cache may lag behind the kubelet).
+func samePod(a, b PodInfo) bool {
+	if a.UID != "" && b.UID != "" {
+		return a.UID == b.UID
+	}
+	return a.Namespace == b.Namespace && a.Name == b.Name
 }
 
 // filterPerProcessCandidates drops devices that need no per-process collection.

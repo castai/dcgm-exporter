@@ -270,9 +270,6 @@ func (p *PodMapper) createPerProcessMetrics(
 	if len(devicePods) == 0 {
 		return nil, nil
 	}
-	if !needsPerProcessAttribution(devicePods) {
-		return nil, nil
-	}
 
 	data := dataMap.metrics[metricsKey]
 	podValues := buildPodValueMap(dataMap.pidToPod, data, counter.FieldName)

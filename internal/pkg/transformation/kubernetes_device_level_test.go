@@ -71,6 +71,16 @@ func TestNeedsPerProcessAttribution(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "same pod name with different UIDs is not one owner",
+			pods: []PodInfo{draPod("default", "pod-a", "uid-1"), draPod("default", "pod-a", "uid-2")},
+			want: true,
+		},
+		{
+			name: "one entry with an unpopulated UID matches by name",
+			pods: []PodInfo{draPod("default", "pod-a", "uid-1"), draPod("default", "pod-a", "")},
+			want: false,
+		},
+		{
 			name: "same pod name in different namespaces is not one owner",
 			pods: []PodInfo{draPod("ns-1", "pod-a", ""), draPod("ns-2", "pod-a", "")},
 			want: true,
