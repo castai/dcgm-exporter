@@ -203,14 +203,17 @@ func (c *perProcessCollector) Collect(gpuDeviceMap map[string]string, deviceToPo
 	return result
 }
 
-// needsPerProcessAttribution returns false when a single DRA pod owns the
-// device, whose device-level value then is the per-pod value.
+// needsPerProcessAttribution returns false when a single DRA pod container
+// owns the device, whose device-level value then is the per-container value.
+// With several containers of one pod holding the device, per-process
+// collection is required to attribute values per container instead of
+// repeating the pod total under each container.
 func needsPerProcessAttribution(pods []PodInfo) bool {
 	if len(pods) == 0 {
 		return false
 	}
 	for _, podInfo := range pods {
-		if podInfo.DynamicResources == nil || !samePod(podInfo, pods[0]) {
+		if podInfo.DynamicResources == nil || !sameConsumer(podInfo, pods[0]) {
 			return true
 		}
 	}
@@ -224,6 +227,48 @@ func samePod(a, b PodInfo) bool {
 		return a.UID == b.UID
 	}
 	return a.Namespace == b.Namespace && a.Name == b.Name
+}
+
+// sameConsumer reports whether two entries describe the same pod container
+// allocation: same pod (samePod) with the same container name and virtual-GPU
+// allocation. This is the attribution identity: per-process values are
+// aggregated per (pod, container, vgpu), and a device-level value can only be
+// attributed when exactly one such consumer holds the device.
+func sameConsumer(a, b PodInfo) bool {
+	return samePod(a, b) && a.Container == b.Container && a.VGPU == b.VGPU
+}
+
+// podContainerKey identifies the emitting series for a per-process value.
+type podContainerKey struct {
+	UID       string
+	Container string
+	VGPU      string
+}
+
+func podKeyFor(podInfo PodInfo) podContainerKey {
+	return podContainerKey{UID: podInfo.UID, Container: podInfo.Container, VGPU: podInfo.VGPU}
+}
+
+// distinctPodConsumers returns one entry per distinct pod container
+// allocation holding a device, compared via sameConsumer. Repeated mappings
+// of the same consumer (for example a pod described through both the device
+// plugin and a DRA claim, or multiple DRA slices) collapse to a single entry
+// so each consumer's series is emitted exactly once.
+func distinctPodConsumers(podInfos []PodInfo) []PodInfo {
+	consumers := make([]PodInfo, 0, len(podInfos))
+	for _, podInfo := range podInfos {
+		duplicate := false
+		for _, existing := range consumers {
+			if sameConsumer(podInfo, existing) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			consumers = append(consumers, podInfo)
+		}
+	}
+	return consumers
 }
 
 // filterPerProcessCandidates drops devices that need no per-process collection.

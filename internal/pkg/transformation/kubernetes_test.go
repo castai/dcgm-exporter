@@ -675,9 +675,17 @@ func TestProcessPodMapper_WithD_Different_Format_Of_DeviceID(t *testing.T) {
 					t.Errorf("expected at least one metric, got 0 for counter: %s", counter.FieldName)
 				}
 
+				// Multiple pods resolving to the same device share it: the
+				// device-level metric must be emitted once, unattributed, rather
+				// than duplicated into each pod's series.
+				sharedDevice := len(tc.PODGPUIDs) > 1
+				if sharedDevice {
+					require.Len(t, metrics[counter], 1)
+				}
+
 				for i, metric := range metrics[counter] {
-					// Only require pod attributes when we expect a pod to be using the GPU.
-					if len(tc.PODGPUIDs) > 0 {
+					// Only require pod attributes when a single pod is expected to be using the GPU.
+					if len(tc.PODGPUIDs) > 0 && !sharedDevice {
 						require.Contains(t, metric.Attributes, podAttribute)
 						require.Contains(t, metric.Attributes, namespaceAttribute)
 						require.Contains(t, metric.Attributes, containerAttribute)
@@ -2197,28 +2205,28 @@ func TestPodMapperProcessDRAPerProcessMetrics(t *testing.T) {
 			virtualGPUs: false, idType: appconfig.GPUUID, claimPods: 2,
 			setupNVML:      mockProcessQueries,
 			wantUtilDevice: 1, wantUtilPods: 2,
-			wantPowerDevice: 0, wantPowerPods: 2,
+			wantPowerDevice: 1, wantPowerPods: 0,
 		},
 		{
 			name:        "shared claim gets per-process metrics, virtual gpus on",
 			virtualGPUs: true, idType: appconfig.GPUUID, claimPods: 2,
 			setupNVML:      mockProcessQueries,
 			wantUtilDevice: 1, wantUtilPods: 2,
-			wantPowerDevice: 0, wantPowerPods: 2,
+			wantPowerDevice: 1, wantPowerPods: 0,
 		},
 		{
 			name:        "shared claim gets per-process metrics, device-name id type",
 			virtualGPUs: true, idType: appconfig.DeviceName, claimPods: 2,
 			setupNVML:      mockProcessQueries,
 			wantUtilDevice: 1, wantUtilPods: 2,
-			wantPowerDevice: 0, wantPowerPods: 2,
+			wantPowerDevice: 1, wantPowerPods: 0,
 		},
 		{
 			name:        "pods with unpopulated UIDs still split per process",
 			virtualGPUs: false, idType: appconfig.GPUUID, claimPods: 2, emptyUIDs: true,
 			setupNVML:      mockProcessQueries,
 			wantUtilDevice: 1, wantUtilPods: 2,
-			wantPowerDevice: 0, wantPowerPods: 2,
+			wantPowerDevice: 1, wantPowerPods: 0,
 		},
 		{
 			name:        "device without claims keeps the original metric",
@@ -2649,17 +2657,25 @@ func TestPodMapperProcessDRAMergeWithDevicePluginPods(t *testing.T) {
 		secondPodDRA      bool // pod2 holds a DRA claim on the same GPU
 		wantUtilPods      int
 		wantDRAPodSeries  int
+		wantDevice        int
+		wantPodValue      string
 	}{
 		{
 			name:              "container with device-plugin device and DRA claim is not duplicated",
 			pod1AlsoClaimsDRA: true,
 			wantUtilPods:      1,
-			wantDRAPodSeries:  0,
+			// The merged consumer keeps its DRA claim metadata, so it follows the
+			// single-claimant optimization: the device value is attributed
+			// directly and carries the claim labels for downstream joins.
+			wantDRAPodSeries: 1,
+			wantDevice:       0,
+			wantPodValue:     "42",
 		},
 		{
 			name:         "device-plugin pod and DRA pod share the GPU",
 			secondPodDRA: true,
 			wantUtilPods: 2, wantDRAPodSeries: 1,
+			wantDevice: 1, wantPodValue: "0",
 		},
 	}
 
@@ -2783,12 +2799,12 @@ func TestPodMapperProcessDRAMergeWithDevicePluginPods(t *testing.T) {
 				}
 			}
 
-			require.Len(t, deviceMetrics, 1)
+			require.Len(t, deviceMetrics, tc.wantDevice)
 			require.Len(t, podMetrics, tc.wantUtilPods)
 
 			draPodSeries := 0
 			for _, m := range podMetrics {
-				assert.Equal(t, "0", m.Value) // no processes attributed
+				assert.Equal(t, tc.wantPodValue, m.Value)
 				if _, ok := m.Attributes[draDriverName]; ok {
 					draPodSeries++
 				}
@@ -3127,14 +3143,14 @@ func TestBuildPodValueMap(t *testing.T) {
 		pidToPod  map[uint32]*PodInfo
 		data      *perProcessMetrics
 		fieldName string
-		expected  map[string]string
+		expected  map[podContainerKey]string
 	}{
 		{
 			name:      "nil data returns empty map",
 			pidToPod:  map[uint32]*PodInfo{1001: {UID: "uid1"}},
 			data:      nil,
 			fieldName: metricGPUUtil,
-			expected:  map[string]string{},
+			expected:  map[podContainerKey]string{},
 		},
 		{
 			name:     "empty pidToPod returns empty map",
@@ -3143,7 +3159,7 @@ func TestBuildPodValueMap(t *testing.T) {
 				pidToSMUtil: map[uint32]uint32{1001: 50},
 			},
 			fieldName: metricGPUUtil,
-			expected:  map[string]string{},
+			expected:  map[podContainerKey]string{},
 		},
 		{
 			name:     "maps PID values to pod UIDs for GPU util",
@@ -3152,7 +3168,7 @@ func TestBuildPodValueMap(t *testing.T) {
 				pidToSMUtil: map[uint32]uint32{1001: 50, 1002: 75},
 			},
 			fieldName: metricGPUUtil,
-			expected:  map[string]string{"uid1": "50", "uid2": "75"},
+			expected:  map[podContainerKey]string{{UID: "uid1"}: "50", {UID: "uid2"}: "75"},
 		},
 		{
 			name:     "maps PID values to pod UIDs for FB used",
@@ -3161,7 +3177,7 @@ func TestBuildPodValueMap(t *testing.T) {
 				pidToMemory: map[uint32]uint64{1001: 1024 * 1024 * 1024},
 			},
 			fieldName: metricFBUsed,
-			expected:  map[string]string{"uid1": "1024"},
+			expected:  map[podContainerKey]string{{UID: "uid1"}: "1024"},
 		},
 		{
 			name:     "skips PIDs without metric data",
@@ -3170,7 +3186,7 @@ func TestBuildPodValueMap(t *testing.T) {
 				pidToSMUtil: map[uint32]uint32{1001: 50},
 			},
 			fieldName: metricGPUUtil,
-			expected:  map[string]string{"uid1": "50"},
+			expected:  map[podContainerKey]string{{UID: "uid1"}: "50"},
 		},
 		{
 			name:     "multiple PIDs same pod - accumulates GPU util",
@@ -3179,7 +3195,7 @@ func TestBuildPodValueMap(t *testing.T) {
 				pidToSMUtil: map[uint32]uint32{1001: 30, 1002: 45},
 			},
 			fieldName: metricGPUUtil,
-			expected:  map[string]string{"uid1": "75"},
+			expected:  map[podContainerKey]string{{UID: "uid1"}: "75"},
 		},
 		{
 			name:     "multiple PIDs same pod - accumulates FB used",
@@ -3188,7 +3204,7 @@ func TestBuildPodValueMap(t *testing.T) {
 				pidToMemory: map[uint32]uint64{1001: 500 * 1024 * 1024, 1002: 300 * 1024 * 1024},
 			},
 			fieldName: metricFBUsed,
-			expected:  map[string]string{"uid1": "800"},
+			expected:  map[podContainerKey]string{{UID: "uid1"}: "800"},
 		},
 		{
 			name: "mixed pods - some with multiple PIDs, some with single PID",
@@ -3200,7 +3216,42 @@ func TestBuildPodValueMap(t *testing.T) {
 				pidToSMUtil: map[uint32]uint32{1001: 20, 1002: 30, 2001: 50},
 			},
 			fieldName: metricGPUUtil,
-			expected:  map[string]string{"uid1": "50", "uid2": "50"},
+			expected:  map[podContainerKey]string{{UID: "uid1"}: "50", {UID: "uid2"}: "50"},
+		},
+		{
+			name: "containers of one pod accumulate separately",
+			pidToPod: map[uint32]*PodInfo{
+				1001: {UID: "uid1", Container: "ctr-a"},
+				1002: {UID: "uid1", Container: "ctr-b"},
+				1003: {UID: "uid1", Container: "ctr-a"},
+			},
+			data: &perProcessMetrics{
+				pidToMemory: map[uint32]uint64{
+					1001: 500 * 1024 * 1024,
+					1002: 300 * 1024 * 1024,
+					1003: 100 * 1024 * 1024,
+				},
+			},
+			fieldName: metricFBUsed,
+			expected: map[podContainerKey]string{
+				{UID: "uid1", Container: "ctr-a"}: "600",
+				{UID: "uid1", Container: "ctr-b"}: "300",
+			},
+		},
+		{
+			name: "vgpu replicas of one container accumulate separately",
+			pidToPod: map[uint32]*PodInfo{
+				1001: {UID: "uid1", Container: "ctr", VGPU: "1"},
+				1002: {UID: "uid1", Container: "ctr", VGPU: "2"},
+			},
+			data: &perProcessMetrics{
+				pidToMemory: map[uint32]uint64{1001: 100 * 1024 * 1024, 1002: 200 * 1024 * 1024},
+			},
+			fieldName: metricFBUsed,
+			expected: map[podContainerKey]string{
+				{UID: "uid1", Container: "ctr", VGPU: "1"}: "100",
+				{UID: "uid1", Container: "ctr", VGPU: "2"}: "200",
+			},
 		},
 	}
 
@@ -3217,27 +3268,33 @@ func TestBuildIdlePodValues(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name           string
-		existingValues map[string]string
+		existingValues map[podContainerKey]string
 		devicePods     []PodInfo
-		expected       map[string]string
+		expected       map[podContainerKey]string
 	}{
 		{
 			name:           "adds zero values for idle pods",
-			existingValues: map[string]string{"uid1": "50"},
+			existingValues: map[podContainerKey]string{{UID: "uid1"}: "50"},
 			devicePods:     []PodInfo{{UID: "uid1"}, {UID: "uid2"}, {UID: "uid3"}},
-			expected:       map[string]string{"uid2": "0", "uid3": "0"},
+			expected:       map[podContainerKey]string{{UID: "uid2"}: "0", {UID: "uid3"}: "0"},
 		},
 		{
 			name:           "skips pods with existing values",
-			existingValues: map[string]string{"uid1": "50", "uid2": "75"},
+			existingValues: map[podContainerKey]string{{UID: "uid1"}: "50", {UID: "uid2"}: "75"},
 			devicePods:     []PodInfo{{UID: "uid1"}, {UID: "uid2"}},
-			expected:       map[string]string{},
+			expected:       map[podContainerKey]string{},
 		},
 		{
 			name:           "all pods idle",
-			existingValues: map[string]string{},
+			existingValues: map[podContainerKey]string{},
 			devicePods:     []PodInfo{{UID: "uid1"}, {UID: "uid2"}},
-			expected:       map[string]string{"uid1": "0", "uid2": "0"},
+			expected:       map[podContainerKey]string{{UID: "uid1"}: "0", {UID: "uid2"}: "0"},
+		},
+		{
+			name:           "containers of one pod idle separately",
+			existingValues: map[podContainerKey]string{{UID: "uid1", Container: "ctr-a"}: "50"},
+			devicePods:     []PodInfo{{UID: "uid1", Container: "ctr-a"}, {UID: "uid1", Container: "ctr-b"}},
+			expected:       map[podContainerKey]string{{UID: "uid1", Container: "ctr-b"}: "0"},
 		},
 	}
 

@@ -125,6 +125,9 @@ func TestBuildPIDToPodMap(t *testing.T) {
 	mapper.pidToUID[1001] = "uid-1"
 	mapper.pidToUID[1002] = "uid-2"
 	mapper.pidToUID[1003] = "uid-unknown"
+	mapper.pidToContainerID[1001] = ""
+	mapper.pidToContainerID[1002] = ""
+	mapper.pidToContainerID[1003] = ""
 
 	result := mapper.buildPIDToPodMap([]uint32{1001, 1002, 1003, 1004}, pods)
 

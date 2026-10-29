@@ -46,6 +46,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
+	v1 "k8s.io/api/core/v1"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 
 	"github.com/NVIDIA/dcgm-exporter/internal/pkg/appconfig"
@@ -269,7 +270,7 @@ func (p *PodMapper) createPerProcessMetrics(
 		metricsKey = val.GPUUUID
 	}
 
-	devicePods := dataMap.deviceToPods[metricsKey]
+	devicePods := distinctPodConsumers(dataMap.deviceToPods[metricsKey])
 	if len(devicePods) == 0 {
 		return nil, nil
 	}
@@ -279,7 +280,7 @@ func (p *PodMapper) createPerProcessMetrics(
 
 	var result []collector.Metric
 	for _, podInfo := range devicePods {
-		value, ok := podValues[podInfo.UID]
+		value, ok := podValues[podKeyFor(podInfo)]
 		if !ok {
 			continue
 		}
@@ -317,28 +318,28 @@ func (p *PodMapper) createPerProcessMetrics(
 	return result, nil
 }
 
-func buildPodValueMap(pidToPod map[uint32]*PodInfo, data *perProcessMetrics, fieldName string) map[string]string {
-	podValues := make(map[string]string)
+func buildPodValueMap(pidToPod map[uint32]*PodInfo, data *perProcessMetrics, fieldName string) map[podContainerKey]string {
+	podValues := make(map[podContainerKey]string)
 	if data == nil {
 		return podValues
 	}
-	podAccum := make(map[string]uint64)
+	podAccum := make(map[podContainerKey]uint64)
 	for pid, podInfo := range pidToPod {
 		if value, ok := data.getValueForMetric(fieldName, pid); ok {
-			podAccum[podInfo.UID] += value
+			podAccum[podKeyFor(*podInfo)] += value
 		}
 	}
-	for uid, total := range podAccum {
-		podValues[uid] = fmt.Sprintf("%d", total)
+	for key, total := range podAccum {
+		podValues[key] = fmt.Sprintf("%d", total)
 	}
 	return podValues
 }
 
-func buildIdlePodValues(existingValues map[string]string, devicePods []PodInfo) map[string]string {
-	idleValues := make(map[string]string)
+func buildIdlePodValues(existingValues map[podContainerKey]string, devicePods []PodInfo) map[podContainerKey]string {
+	idleValues := make(map[podContainerKey]string)
 	for _, podInfo := range devicePods {
-		if _, ok := existingValues[podInfo.UID]; !ok {
-			idleValues[podInfo.UID] = "0"
+		if _, ok := existingValues[podKeyFor(podInfo)]; !ok {
+			idleValues[podKeyFor(podInfo)] = "0"
 		}
 	}
 	return idleValues
@@ -487,7 +488,7 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 					return err
 				}
 
-				podInfos := deviceToPods[deviceID]
+				podInfos := distinctPodConsumers(deviceToPods[deviceID])
 				if isPerProcessMetric(counter.FieldName) {
 					perProcessMetrics, err := p.createPerProcessMetrics(
 						val,
@@ -504,6 +505,16 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 						newmetrics = append(newmetrics, perProcessMetrics...)
 						continue
 					}
+				}
+				if len(podInfos) > 1 {
+					// The device is shared by multiple pod containers (time-slicing,
+					// MPS, or a shared MIG instance), so its device-level value cannot
+					// be attributed to any single one of them: only per-process
+					// metrics are genuinely per-container. Emit the single
+					// device-level series instead of duplicating the device value into
+					// every co-located consumer's series.
+					newmetrics = append(newmetrics, metrics[counter][j])
+					continue
 				}
 				for _, pi := range podInfos {
 					metric := cloneMetric(metrics[counter][j])
@@ -587,8 +598,9 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 						return err
 					}
 
-					podInfos := deviceToPodsDRA[lookupKey]
-					if podInfos != nil {
+					draPods := deviceToPodsDRA[lookupKey]
+					if draPods != nil {
+						podInfos := distinctPodConsumers(draPods)
 						if isPerProcessMetric(counter.FieldName) {
 							perProcessMetrics, err := p.createPerProcessMetrics(
 								val,
@@ -605,6 +617,15 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 								newmetrics = append(newmetrics, perProcessMetrics...)
 								continue
 							}
+						}
+						if len(podInfos) > 1 {
+							// Shared DRA device (e.g. an MPS or time-slicing shared claim):
+							// emit a single unattributed device-level series instead of
+							// duplicating the device value into every co-located consumer's
+							// series. Per-process metrics were already emitted above when
+							// available.
+							newmetrics = append(newmetrics, metrics[counter][j])
+							continue
 						}
 						for _, pi := range podInfos {
 							metric := cloneMetric(metrics[counter][j])
@@ -687,8 +708,14 @@ func mergeDRAIntoSharingPods(sharing, dra map[string][]PodInfo, uuidToDeviceID m
 		existing := sharing[targetKey]
 		for _, podInfo := range podInfos {
 			duplicate := false
-			for _, entry := range existing {
-				if samePod(entry, podInfo) && entry.Container == podInfo.Container {
+			for i := range existing {
+				if samePod(existing[i], podInfo) && existing[i].Container == podInfo.Container {
+					// Preserve the DRA metadata on the retained entry: the
+					// device-plugin description of the same consumer carries no
+					// claim identity, so downstream joins would lose it.
+					if existing[i].DynamicResources == nil && podInfo.DynamicResources != nil {
+						existing[i].DynamicResources = podInfo.DynamicResources
+					}
 					duplicate = true
 					break
 				}
@@ -1383,6 +1410,7 @@ func (p *PodMapper) toDeviceToPod(
 func (p *PodMapper) createPodInfo(pod *podresourcesapi.PodResources, container *podresourcesapi.ContainerResources) PodInfo {
 	labels := map[string]string{}
 	uid := ""
+	var containerIDs map[string]string
 
 	// Use PodLister to get metadata
 	if p.podLister != nil {
@@ -1394,6 +1422,7 @@ func (p *PodMapper) createPodInfo(pod *podresourcesapi.PodResources, container *
 				"error", err)
 		} else {
 			uid = string(podObj.UID)
+			containerIDs = containerIDNameMap(podObj)
 
 			if p.Config.KubernetesEnablePodLabels {
 				for k, v := range podObj.Labels {
@@ -1408,12 +1437,48 @@ func (p *PodMapper) createPodInfo(pod *podresourcesapi.PodResources, container *
 	}
 
 	return PodInfo{
-		Name:      pod.GetName(),
-		Namespace: pod.GetNamespace(),
-		Container: container.GetName(),
-		UID:       uid,
-		Labels:    labels,
+		Name:         pod.GetName(),
+		Namespace:    pod.GetNamespace(),
+		Container:    container.GetName(),
+		UID:          uid,
+		Labels:       labels,
+		containerIDs: containerIDs,
 	}
+}
+
+// containerIDNameMap maps runtime container IDs to container names from the
+// pod status. The PID-to-container resolution uses it to attribute
+// per-process values to the owning container: a process's cgroup path carries
+// the runtime container ID, which this map translates to the Kubernetes
+// container name reported by the kubelet pod-resources API.
+func containerIDNameMap(pod *v1.Pod) map[string]string {
+	var ids map[string]string
+	add := func(statuses []v1.ContainerStatus) {
+		for i := range statuses {
+			id, ok := containerIDFromRef(statuses[i].ContainerID)
+			if !ok {
+				continue
+			}
+			if ids == nil {
+				ids = make(map[string]string)
+			}
+			ids[id] = statuses[i].Name
+		}
+	}
+	add(pod.Status.ContainerStatuses)
+	add(pod.Status.InitContainerStatuses)
+	add(pod.Status.EphemeralContainerStatuses)
+	return ids
+}
+
+// containerIDFromRef splits a runtime container ID reference of the form
+// "<runtime>://<id>" (for example "containerd://abc...").
+func containerIDFromRef(ref string) (string, bool) {
+	runtime, id, found := strings.Cut(ref, "://")
+	if !found || runtime == "" || id == "" {
+		return "", false
+	}
+	return id, true
 }
 
 // shouldIncludeLabel checks if a label should be included based on the allowlist regex patterns.

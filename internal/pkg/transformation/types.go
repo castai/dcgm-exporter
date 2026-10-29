@@ -81,6 +81,11 @@ type PodInfo struct {
 	VGPU             string
 	Labels           map[string]string
 	DynamicResources *DynamicResourceInfo
+	// containerIDs maps runtime container IDs to container names for this
+	// pod, built from the pod status. It resolves a process's cgroup
+	// container ID to the owning container so per-process values can be
+	// attributed per container instead of only per pod.
+	containerIDs map[string]string
 }
 
 type DRAResourceSliceManager struct {
