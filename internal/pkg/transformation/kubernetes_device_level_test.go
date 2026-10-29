@@ -235,20 +235,24 @@ func assertDeviceLevelScenario(
 	pods []deviceLevelTestPod,
 	deviceMetrics, podMetrics []collector.Metric,
 	wantDevice int, deviceValue, wantPodValue string,
+	wantPodMetrics int,
 ) {
 	t.Helper()
 	require.Len(t, deviceMetrics, wantDevice)
 	for _, m := range deviceMetrics {
 		assert.Equal(t, deviceValue, m.Value)
+		assert.NotContains(t, m.Attributes, podAttribute)
 	}
-	require.Len(t, podMetrics, len(pods))
+	require.Len(t, podMetrics, wantPodMetrics)
 	podNames := make(map[string]bool, len(podMetrics))
 	for _, m := range podMetrics {
 		assert.Equal(t, wantPodValue, m.Value)
 		podNames[m.Attributes[podAttribute]] = true
 	}
-	for _, p := range pods {
-		assert.True(t, podNames[p.name], "missing series for pod %s", p.name)
+	if wantPodMetrics > 0 {
+		for _, p := range pods {
+			assert.True(t, podNames[p.name], "missing series for pod %s", p.name)
+		}
 	}
 }
 
@@ -267,69 +271,100 @@ func TestPodMapperProcessDeviceLevelMetric(t *testing.T) {
 	}
 
 	tests := []struct {
-		name         string
-		virtualGPUs  bool
-		pods         []deviceLevelTestPod
-		counter      counters.Counter
-		setupNVML    func(*mocknvmlprovider.MockNVML)
-		wantDevice   int
-		wantPodValue string
+		name           string
+		virtualGPUs    bool
+		pods           []deviceLevelTestPod
+		counter        counters.Counter
+		setupNVML      func(*mocknvmlprovider.MockNVML)
+		wantDevice     int
+		wantPodMetrics int
+		wantPodValue   string
 	}{
 		{
-			name:         "single DRA pod gets the device value, virtual gpus on",
-			virtualGPUs:  true,
-			pods:         []deviceLevelTestPod{{name: "pod-a", dra: true}},
-			counter:      gpuUtil,
-			setupNVML:    noNVMLProcessQueries,
-			wantPodValue: "42",
+			name:           "single DRA pod gets the device value, virtual gpus on",
+			virtualGPUs:    true,
+			pods:           []deviceLevelTestPod{{name: "pod-a", dra: true}},
+			counter:        gpuUtil,
+			setupNVML:      noNVMLProcessQueries,
+			wantPodMetrics: 1,
+			wantPodValue:   "42",
 		},
 		{
-			name:         "single DRA pod gets the device value, virtual gpus off",
-			pods:         []deviceLevelTestPod{{name: "pod-a", dra: true}},
-			counter:      gpuUtil,
-			setupNVML:    noNVMLProcessQueries,
-			wantPodValue: "42",
+			name:           "single DRA pod gets the device value, virtual gpus off",
+			pods:           []deviceLevelTestPod{{name: "pod-a", dra: true}},
+			counter:        gpuUtil,
+			setupNVML:      noNVMLProcessQueries,
+			wantPodMetrics: 1,
+			wantPodValue:   "42",
 		},
 		{
-			name:         "single DRA pod, non-per-process metric",
-			virtualGPUs:  true,
-			pods:         []deviceLevelTestPod{{name: "pod-a", dra: true}},
-			counter:      power,
-			setupNVML:    noNVMLProcessQueries,
-			wantPodValue: "42",
+			name:           "single DRA pod, non-per-process metric",
+			virtualGPUs:    true,
+			pods:           []deviceLevelTestPod{{name: "pod-a", dra: true}},
+			counter:        power,
+			setupNVML:      noNVMLProcessQueries,
+			wantPodMetrics: 1,
+			wantPodValue:   "42",
 		},
 		{
-			name:         "single device-plugin pod keeps the device-level series",
-			virtualGPUs:  true,
-			pods:         []deviceLevelTestPod{{name: "pod-a"}},
-			counter:      gpuUtil,
-			setupNVML:    noProcesses,
-			wantDevice:   1,
-			wantPodValue: "0",
+			name:           "single device-plugin pod keeps the device-level series",
+			virtualGPUs:    true,
+			pods:           []deviceLevelTestPod{{name: "pod-a"}},
+			counter:        gpuUtil,
+			setupNVML:      noProcesses,
+			wantDevice:     1,
+			wantPodMetrics: 1,
+			wantPodValue:   "0",
 		},
 		{
-			name:         "shared DRA claim keeps the device-level series, virtual gpus on",
-			virtualGPUs:  true,
-			pods:         []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
-			counter:      gpuUtil,
-			setupNVML:    noProcesses,
-			wantDevice:   1,
-			wantPodValue: "0",
+			name:           "shared DRA claim keeps the device-level series, virtual gpus on",
+			virtualGPUs:    true,
+			pods:           []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
+			counter:        gpuUtil,
+			setupNVML:      noProcesses,
+			wantDevice:     1,
+			wantPodMetrics: 2,
+			wantPodValue:   "0",
 		},
 		{
-			name:         "shared DRA claim keeps the device-level series, virtual gpus off",
-			pods:         []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
-			counter:      gpuUtil,
-			setupNVML:    noProcesses,
-			wantDevice:   1,
-			wantPodValue: "0",
+			name:           "shared DRA claim keeps the device-level series, virtual gpus off",
+			pods:           []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
+			counter:        gpuUtil,
+			setupNVML:      noProcesses,
+			wantDevice:     1,
+			wantPodMetrics: 2,
+			wantPodValue:   "0",
+		},
+		{
+			name:        "shared DRA claim: non-per-process metric emitted once without pod attribution, virtual gpus on",
+			virtualGPUs: true,
+			pods:        []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
+			counter:     power,
+			setupNVML:   noProcesses,
+			wantDevice:  1,
+		},
+		{
+			name:       "shared DRA claim: non-per-process metric emitted once without pod attribution, virtual gpus off",
+			pods:       []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
+			counter:    power,
+			setupNVML:  noProcesses,
+			wantDevice: 1,
+		},
+		{
+			name:           "shared device-plugin GPUs: non-per-process metric emitted once without pod attribution",
+			virtualGPUs:    true,
+			pods:           []deviceLevelTestPod{{name: "pod-a"}, {name: "pod-b"}},
+			counter:        power,
+			setupNVML:      noProcesses,
+			wantDevice:     1,
+			wantPodMetrics: 0,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			deviceMetrics, podMetrics := runDeviceLevelScenario(t, tc.virtualGPUs, tc.pods, tc.counter, "42", tc.setupNVML)
-			assertDeviceLevelScenario(t, tc.pods, deviceMetrics, podMetrics, tc.wantDevice, "42", tc.wantPodValue)
+			assertDeviceLevelScenario(t, tc.pods, deviceMetrics, podMetrics, tc.wantDevice, "42", tc.wantPodValue, tc.wantPodMetrics)
 		})
 	}
 }
@@ -350,71 +385,87 @@ func TestPodMapperProcessMPSDeviceLevelMetric(t *testing.T) {
 
 	gpuUtil := counters.Counter{FieldID: 203, FieldName: metricGPUUtil, PromType: "gauge"}
 	fbUsed := counters.Counter{FieldID: 252, FieldName: metricFBUsed, PromType: "gauge"}
+	power := counters.Counter{FieldID: 155, FieldName: "DCGM_FI_DEV_POWER_USAGE", PromType: "gauge"}
 
 	tests := []struct {
-		name         string
-		virtualGPUs  bool
-		pods         []deviceLevelTestPod
-		counter      counters.Counter
-		deviceValue  string
-		setupNVML    func(*mocknvmlprovider.MockNVML)
-		wantDevice   int
-		wantPodValue string
+		name           string
+		virtualGPUs    bool
+		pods           []deviceLevelTestPod
+		counter        counters.Counter
+		deviceValue    string
+		setupNVML      func(*mocknvmlprovider.MockNVML)
+		wantDevice     int
+		wantPodMetrics int
+		wantPodValue   string
 	}{
 		{
-			name:         "device-plugin MPS, single pod: utilization stays on the device-level series",
-			virtualGPUs:  true,
-			pods:         []deviceLevelTestPod{{name: "pod-a"}},
-			counter:      gpuUtil,
-			deviceValue:  "94",
-			setupNVML:    mpsServer,
-			wantDevice:   1,
-			wantPodValue: "0",
+			name:           "device-plugin MPS, single pod: utilization stays on the device-level series",
+			virtualGPUs:    true,
+			pods:           []deviceLevelTestPod{{name: "pod-a"}},
+			counter:        gpuUtil,
+			deviceValue:    "94",
+			setupNVML:      mpsServer,
+			wantDevice:     1,
+			wantPodMetrics: 1,
+			wantPodValue:   "0",
 		},
 		{
-			name:         "device-plugin MPS, single pod: memory stays on the device-level series",
-			virtualGPUs:  true,
-			pods:         []deviceLevelTestPod{{name: "pod-a"}},
-			counter:      fbUsed,
-			deviceValue:  "72",
-			setupNVML:    mpsServer,
-			wantDevice:   1,
-			wantPodValue: "0",
+			name:           "device-plugin MPS, single pod: memory stays on the device-level series",
+			virtualGPUs:    true,
+			pods:           []deviceLevelTestPod{{name: "pod-a"}},
+			counter:        fbUsed,
+			deviceValue:    "72",
+			setupNVML:      mpsServer,
+			wantDevice:     1,
+			wantPodMetrics: 1,
+			wantPodValue:   "0",
 		},
 		{
-			name:         "DRA MPS, single pod: pod series carries the device utilization",
-			virtualGPUs:  true,
-			pods:         []deviceLevelTestPod{{name: "pod-a", dra: true}},
-			counter:      gpuUtil,
-			deviceValue:  "94",
-			setupNVML:    noNVMLProcessQueries,
-			wantPodValue: "94",
+			name:           "DRA MPS, single pod: pod series carries the device utilization",
+			virtualGPUs:    true,
+			pods:           []deviceLevelTestPod{{name: "pod-a", dra: true}},
+			counter:        gpuUtil,
+			deviceValue:    "94",
+			setupNVML:      noNVMLProcessQueries,
+			wantPodMetrics: 1,
+			wantPodValue:   "94",
 		},
 		{
-			name:         "DRA MPS, shared claim: utilization stays on the device-level series",
-			virtualGPUs:  true,
-			pods:         []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
-			counter:      gpuUtil,
-			deviceValue:  "94",
-			setupNVML:    mpsServer,
-			wantDevice:   1,
-			wantPodValue: "0",
+			name:           "DRA MPS, shared claim: utilization stays on the device-level series",
+			virtualGPUs:    true,
+			pods:           []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
+			counter:        gpuUtil,
+			deviceValue:    "94",
+			setupNVML:      mpsServer,
+			wantDevice:     1,
+			wantPodMetrics: 2,
+			wantPodValue:   "0",
 		},
 		{
-			name:         "DRA MPS, shared claim, virtual gpus off: utilization stays on the device-level series",
-			pods:         []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
-			counter:      gpuUtil,
-			deviceValue:  "94",
-			setupNVML:    mpsServer,
-			wantDevice:   1,
-			wantPodValue: "0",
+			name:           "DRA MPS, shared claim, virtual gpus off: utilization stays on the device-level series",
+			pods:           []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
+			counter:        gpuUtil,
+			deviceValue:    "94",
+			setupNVML:      mpsServer,
+			wantDevice:     1,
+			wantPodMetrics: 2,
+			wantPodValue:   "0",
+		},
+		{
+			name:        "DRA MPS, shared claim: non-per-process metric emitted once without pod attribution",
+			virtualGPUs: true,
+			pods:        []deviceLevelTestPod{{name: "pod-a", dra: true}, {name: "pod-b", dra: true}},
+			counter:     power,
+			deviceValue: "94",
+			setupNVML:   mpsServer,
+			wantDevice:  1,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			deviceMetrics, podMetrics := runDeviceLevelScenario(t, tc.virtualGPUs, tc.pods, tc.counter, tc.deviceValue, tc.setupNVML)
-			assertDeviceLevelScenario(t, tc.pods, deviceMetrics, podMetrics, tc.wantDevice, tc.deviceValue, tc.wantPodValue)
+			assertDeviceLevelScenario(t, tc.pods, deviceMetrics, podMetrics, tc.wantDevice, tc.deviceValue, tc.wantPodValue, tc.wantPodMetrics)
 		})
 	}
 }

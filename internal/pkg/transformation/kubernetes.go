@@ -342,6 +342,31 @@ func buildIdlePodValues(existingValues map[string]string, devicePods []PodInfo) 
 	return idleValues
 }
 
+// countPodConsumers returns the number of distinct pod containers holding a
+// device, compared via samePod (UID with a namespace/name fallback for
+// unpopulated UIDs) plus the container name. A device-level metric can only be
+// attributed to a pod when that pod is the device's sole consumer; when several
+// pods share a device (GPU time-slicing, MPS, or a shared MIG instance),
+// attributing the device-level value to each pod duplicates the device value
+// into every pod's series, which downstream consumers read as genuine per-pod
+// measurements.
+func countPodConsumers(podInfos []PodInfo) int {
+	consumers := make([]PodInfo, 0, len(podInfos))
+	for _, podInfo := range podInfos {
+		sameConsumer := false
+		for _, existing := range consumers {
+			if podInfo.Container == existing.Container && samePod(podInfo, existing) {
+				sameConsumer = true
+				break
+			}
+		}
+		if !sameConsumer {
+			consumers = append(consumers, podInfo)
+		}
+	}
+	return len(consumers)
+}
+
 func (p *PodMapper) Run() {
 	if p.podInformerFactory != nil {
 		go p.podInformerFactory.Start(p.stopChan)
@@ -460,6 +485,16 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 						continue
 					}
 				}
+				if countPodConsumers(podInfos) > 1 {
+					// The device is shared by multiple pods (time-slicing, MPS,
+					// or a shared MIG instance), so its device-level value cannot
+					// be attributed to any single one of them: only per-process
+					// metrics are genuinely per-pod. Emit the single device-level
+					// series instead of duplicating the device value into every
+					// co-located pod's series.
+					newmetrics = append(newmetrics, metrics[counter][j])
+					continue
+				}
 				for _, pi := range podInfos {
 					metric, err := utils.DeepCopy(metrics[counter][j])
 					if err != nil {
@@ -492,9 +527,11 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 
 					newmetrics = append(newmetrics, metric)
 				}
-				// Emit the device-level metric for idle GPUs (0 pods) or shared
-				// GPUs (2+ pods). With exactly 1 pod, skip the duplicate since
-				// the per-pod value equals the device-level value.
+				// Emit the device-level metric for idle GPUs (0 pods) and for a
+				// single pod holding multiple replicas of one device; shared
+				// devices were already emitted above. With exactly 1 pod entry,
+				// skip the duplicate since the per-pod value equals the
+				// device-level value.
 				if len(podInfos) != 1 {
 					newmetrics = append(newmetrics, metrics[counter][j])
 				}
@@ -579,6 +616,15 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 								newmetrics = append(newmetrics, perProcessMetrics...)
 								continue
 							}
+						}
+						if countPodConsumers(podInfos) > 1 {
+							// Shared DRA device (e.g. an MPS or time-slicing shared
+							// claim): emit a single unattributed device-level series
+							// instead of duplicating the device value into every
+							// co-located pod's series. Per-process metrics were
+							// already emitted above when available.
+							newmetrics = append(newmetrics, metrics[counter][j])
+							continue
 						}
 						for _, pi := range podInfos {
 							metric, err := utils.DeepCopy(metrics[counter][j])

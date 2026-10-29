@@ -663,9 +663,17 @@ func TestProcessPodMapper_WithD_Different_Format_Of_DeviceID(t *testing.T) {
 					t.Errorf("expected at least one metric, got 0 for counter: %s", counter.FieldName)
 				}
 
+				// Multiple pods resolving to the same device share it: the
+				// device-level metric must be emitted once, unattributed, rather
+				// than duplicated into each pod's series.
+				sharedDevice := len(tc.PODGPUIDs) > 1
+				if sharedDevice {
+					require.Len(t, metrics[counter], 1)
+				}
+
 				for i, metric := range metrics[counter] {
-					// Only require pod attributes when we expect a pod to be using the GPU.
-					if len(tc.PODGPUIDs) > 0 {
+					// Only require pod attributes when a single pod is expected to be using the GPU.
+					if len(tc.PODGPUIDs) > 0 && !sharedDevice {
 						require.Contains(t, metric.Attributes, podAttribute)
 						require.Contains(t, metric.Attributes, namespaceAttribute)
 						require.Contains(t, metric.Attributes, containerAttribute)
