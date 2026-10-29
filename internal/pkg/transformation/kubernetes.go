@@ -334,6 +334,31 @@ func buildPodValueMap(pidToPod map[uint32]*PodInfo, data *perProcessMetrics, fie
 	return podValues
 }
 
+// podConsumerKey uniquely identifies the pod container consuming a device.
+type podConsumerKey struct {
+	namespace string
+	pod       string
+	container string
+}
+
+// countPodConsumers returns the number of distinct pod containers holding a
+// device. A device-level metric can only be attributed to a pod when that pod
+// is the device's sole consumer; when several pods share a device (GPU
+// time-slicing, MPS, or a shared MIG instance), attributing the device-level
+// value to each pod duplicates the device value into every pod's series,
+// which downstream consumers read as genuine per-pod measurements.
+func countPodConsumers(podInfos []PodInfo) int {
+	consumers := make(map[podConsumerKey]struct{}, len(podInfos))
+	for _, podInfo := range podInfos {
+		consumers[podConsumerKey{
+			namespace: podInfo.Namespace,
+			pod:       podInfo.Name,
+			container: podInfo.Container,
+		}] = struct{}{}
+	}
+	return len(consumers)
+}
+
 func buildIdlePodValues(existingValues map[string]string, devicePods []PodInfo) map[string]string {
 	idleValues := make(map[string]string)
 	for _, podInfo := range devicePods {
@@ -500,6 +525,16 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 						continue
 					}
 				}
+				if countPodConsumers(podInfos) > 1 {
+					// The device is shared by multiple pods (time-slicing, MPS,
+					// or a shared MIG instance), so its device-level value cannot
+					// be attributed to any single pod: only per-process metrics
+					// are genuinely per-pod. Emit a single unattributed device-level
+					// series instead of duplicating the device value into every
+					// co-located pod's series.
+					newmetrics = append(newmetrics, metrics[counter][j])
+					continue
+				}
 				for _, pi := range podInfos {
 					metric := cloneMetric(metrics[counter][j])
 					p.addPodIdentityAttributes(&metric, pi)
@@ -570,7 +605,13 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 					}
 
 					podInfos := deviceToPodsDRA[deviceID]
-					if podInfos != nil {
+					if podInfos != nil && countPodConsumers(podInfos) > 1 {
+						// Shared DRA device (e.g. an MPS or time-slicing shared
+						// claim): emit a single unattributed device-level series
+						// instead of duplicating the device value into every
+						// co-located pod's series.
+						newmetrics = append(newmetrics, metrics[counter][j])
+					} else if podInfos != nil {
 						for _, pi := range podInfos {
 							metric := cloneMetric(metrics[counter][j])
 							p.addPodIdentityAttributes(&metric, pi)

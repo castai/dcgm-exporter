@@ -675,9 +675,17 @@ func TestProcessPodMapper_WithD_Different_Format_Of_DeviceID(t *testing.T) {
 					t.Errorf("expected at least one metric, got 0 for counter: %s", counter.FieldName)
 				}
 
+				// Multiple pods resolving to the same device share it: the
+				// device-level metric must be emitted once, unattributed, rather
+				// than duplicated into each pod's series.
+				sharedDevice := len(tc.PODGPUIDs) > 1
+				if sharedDevice {
+					require.Len(t, metrics[counter], 1)
+				}
+
 				for i, metric := range metrics[counter] {
-					// Only require pod attributes when we expect a pod to be using the GPU.
-					if len(tc.PODGPUIDs) > 0 {
+					// Only require pod attributes when a single pod is expected to be using the GPU.
+					if len(tc.PODGPUIDs) > 0 && !sharedDevice {
 						require.Contains(t, metric.Attributes, podAttribute)
 						require.Contains(t, metric.Attributes, namespaceAttribute)
 						require.Contains(t, metric.Attributes, containerAttribute)
@@ -1800,6 +1808,122 @@ func TestPodMapperProcessAddsDRAAttributesForMIGMetric(t *testing.T) {
 	}
 }
 
+func TestPodMapperProcessDRASharedDeviceEmitsUnattributedMetric(t *testing.T) {
+	testutils.RequireLinux(t)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	realNVML := nvmlprovider.Client()
+	t.Cleanup(func() { nvmlprovider.SetClient(realNVML) })
+
+	mockNVMLProvider := mocknvmlprovider.NewMockNVML(ctrl)
+	nvmlprovider.SetClient(mockNVMLProvider)
+
+	tmpDir, cleanup := testutils.CreateTmpDir(t)
+	defer cleanup()
+	socketPath := filepath.Join(tmpDir, "kubelet.sock")
+
+	newPod := func(name, claimName string) *podresourcesapi.PodResources {
+		return &podresourcesapi.PodResources{
+			Name:      name,
+			Namespace: "default",
+			Containers: []*podresourcesapi.ContainerResources{{
+				Name: "ctr1",
+				DynamicResources: []*podresourcesapi.DynamicResource{{
+					ClaimName:      claimName,
+					ClaimNamespace: "ns1",
+					ClaimResources: []*podresourcesapi.ClaimResource{{
+						DriverName: DRAGPUDriverName,
+						PoolName:   "poolA",
+						DeviceName: "gpu-x",
+					}},
+				}},
+			}},
+		}
+	}
+
+	server := grpc.NewServer()
+	podresourcesapi.RegisterPodResourcesListerServer(server, &dynamicResourcePodResourcesServer{
+		response: &podresourcesapi.ListPodResourcesResponse{
+			PodResources: []*podresourcesapi.PodResources{
+				newPod("pod1", "claim1"),
+				newPod("pod2", "claim2"),
+			},
+		},
+	})
+	cleanupServer := testutils.StartMockServer(t, server, socketPath)
+	defer cleanupServer()
+
+	clientset := fake.NewClientset(
+		&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default", UID: types.UID("pod-uid-1")}},
+		&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2", Namespace: "default", UID: types.UID("pod-uid-2")}},
+	)
+
+	draManager := newTestDRAManagerWithDevices(map[string]testDRADeviceMapping{
+		draDeviceKey("poolA", "gpu-x"): {uuid: "GPU-shared-uuid"},
+	})
+
+	pm := &PodMapper{
+		Config: &appconfig.Config{
+			KubernetesEnableDRA:       true,
+			KubernetesGPUIdType:       appconfig.GPUUID,
+			PodResourcesKubeletSocket: socketPath,
+			NvidiaResourceNames:       []string{appconfig.NvidiaResourceName},
+		},
+		ResourceSliceManager: draManager,
+		Client:               clientset,
+		labelFilterCache:     newLabelFilterCache(nil, 1000),
+		stopChan:             make(chan struct{}),
+	}
+	defer pm.Stop()
+	setupMockInformer(t, pm, clientset)
+
+	mockSystemInfo := mockdeviceinfo.NewMockProvider(ctrl)
+	mockSystemInfo.EXPECT().InfoType().Return(dcgm.FE_GPU).AnyTimes()
+	mockSystemInfo.EXPECT().GPUCount().Return(toUint(1)).AnyTimes()
+	mockSystemInfo.EXPECT().GPU(toUint(0)).Return(deviceinfo.GPUInfo{
+		DeviceInfo: dcgm.Device{
+			UUID: "GPU-shared-uuid",
+			GPU:  0,
+		},
+	}).AnyTimes()
+
+	counter := counters.Counter{
+		FieldID:   155,
+		FieldName: "DCGM_FI_DEV_POWER_USAGE",
+		PromType:  "gauge",
+	}
+	metrics := collector.MetricsByCounter{
+		counter: {{
+			GPU:        "0",
+			GPUUUID:    "GPU-shared-uuid",
+			Value:      "42",
+			Attributes: map[string]string{},
+			Labels:     map[string]string{},
+			Counter:    counter,
+		}},
+	}
+
+	err := pm.Process(metrics, mockSystemInfo)
+	require.NoError(t, err)
+	require.Len(t, metrics[counter], 1)
+
+	got := metrics[counter][0]
+	// The device is shared by two pods: the device-level metric must not be
+	// attributed to, or duplicated across, either of them.
+	assert.NotContains(t, got.Attributes, podAttribute)
+	assert.NotContains(t, got.Attributes, namespaceAttribute)
+	assert.NotContains(t, got.Attributes, containerAttribute)
+	assert.NotContains(t, got.Attributes, uidAttribute)
+	assert.NotContains(t, got.Attributes, draClaimName)
+	assert.NotContains(t, got.Attributes, draClaimNamespace)
+	assert.NotContains(t, got.Attributes, draDriverName)
+	assert.NotContains(t, got.Attributes, draPoolName)
+	assert.NotContains(t, got.Attributes, draDeviceName)
+	assert.Equal(t, "42", got.Value)
+}
+
 func TestProcessPodMapper_WithUID(t *testing.T) {
 	testutils.RequireLinux(t)
 
@@ -2671,6 +2795,154 @@ func TestKubernetesVirtualGPUs_UnusedGPUsPreserveMetrics(t *testing.T) {
 			require.Len(t, deviceMetrics, tc.wantDeviceMetrics)
 			for _, m := range deviceMetrics {
 				require.NotContains(t, m.Attributes, podAttribute)
+			}
+		})
+	}
+}
+
+func TestKubernetesVirtualGPUs_SharedDeviceMetricsAreUnattributed(t *testing.T) {
+	testutils.RequireLinux(t)
+
+	testCases := []struct {
+		name              string
+		counter           counters.Counter
+		wantPodMetrics    int
+		wantDeviceMetrics int
+	}{
+		{
+			name: "non-per-process metric is emitted once without pod attribution",
+			counter: counters.Counter{
+				FieldID:   155,
+				FieldName: "DCGM_FI_DEV_POWER_USAGE",
+				PromType:  "gauge",
+			},
+			wantPodMetrics:    0,
+			wantDeviceMetrics: 2,
+		},
+		{
+			name: "per-process metric stays per-pod alongside the device-level series",
+			counter: counters.Counter{
+				FieldID:   203,
+				FieldName: metricFBUsed,
+				PromType:  "gauge",
+			},
+			wantPodMetrics:    2,
+			wantDeviceMetrics: 2,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// gpu-uuid-0 is shared by two pods; gpu-uuid-1 is unused.
+			allGPUUUIDs := []string{"gpu-uuid-0", "gpu-uuid-1"}
+			inUseGPUUUIDs := []string{"gpu-uuid-0", "gpu-uuid-0"}
+
+			tmpDir, cleanup := testutils.CreateTmpDir(t)
+			defer cleanup()
+			socketPath := tmpDir + "/kubelet.sock"
+			server := grpc.NewServer()
+			defer server.Stop()
+
+			config := &appconfig.Config{
+				UseRemoteHE:   false,
+				Kubernetes:    true,
+				EnableDCGMLog: true,
+				DCGMLogLevel:  "DEBUG",
+			}
+			dcgmprovider.SmartDCGMInit(t, config)
+			defer dcgmprovider.Client().Cleanup()
+
+			podresourcesapi.RegisterPodResourcesListerServer(server,
+				testutils.NewMockPodResourcesServer(appconfig.NvidiaResourceName, inUseGPUUUIDs))
+			cleanupServer := testutils.StartMockServer(t, server, socketPath)
+			defer cleanupServer()
+
+			clientset := fake.NewClientset(
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "gpu-pod-0", Namespace: "default"}},
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "gpu-pod-1", Namespace: "default"}},
+			)
+
+			ctrl := gomock.NewController(t)
+			mockNVMLProvider := mocknvmlprovider.NewMockNVML(ctrl)
+			mockNVMLProvider.EXPECT().GetMIGDeviceInfoByID(gomock.Any()).Return(&nvmlprovider.MIGDeviceInfo{}, nil).AnyTimes()
+			mockNVMLProvider.EXPECT().GetDeviceProcessMemory(gomock.Any()).Return(map[uint32]uint64{}, nil).AnyTimes()
+			mockNVMLProvider.EXPECT().GetDeviceProcessUtilization(gomock.Any()).Return(map[uint32]uint32{}, nil).AnyTimes()
+			mockNVMLProvider.EXPECT().GetAllMIGDevicesProcessMemory(gomock.Any()).Return(map[uint]map[uint32]uint64{}, nil).AnyTimes()
+			nvmlprovider.SetClient(mockNVMLProvider)
+
+			podMapper := NewPodMapper(&appconfig.Config{
+				KubernetesGPUIdType:       appconfig.GPUUID,
+				KubernetesEnablePodLabels: true,
+				PodResourcesKubeletSocket: socketPath,
+				KubernetesVirtualGPUs:     true,
+			})
+			require.NotNil(t, podMapper)
+			defer podMapper.Stop()
+			podMapper.Client = clientset
+			setupMockInformer(t, podMapper, clientset)
+
+			metrics := collector.MetricsByCounter{}
+			for i, gpuUUID := range allGPUUUIDs {
+				metrics[tc.counter] = append(metrics[tc.counter], collector.Metric{
+					GPU:        fmt.Sprint(i),
+					GPUUUID:    gpuUUID,
+					Value:      fmt.Sprint(42 + i),
+					Counter:    tc.counter,
+					Attributes: map[string]string{},
+				})
+			}
+
+			mockSystemInfo := mockdeviceinfo.NewMockProvider(ctrl)
+			mockSystemInfo.EXPECT().InfoType().Return(dcgm.FE_GPU).AnyTimes()
+			mockSystemInfo.EXPECT().GPUCount().Return(toUint(len(allGPUUUIDs))).AnyTimes()
+			for i, uuid := range allGPUUUIDs {
+				mockSystemInfo.EXPECT().GPU(toUint(i)).Return(deviceinfo.GPUInfo{
+					DeviceInfo: dcgm.Device{
+						UUID: uuid,
+						GPU:  toUint(i),
+					},
+				}).AnyTimes()
+			}
+
+			err := podMapper.Process(metrics, mockSystemInfo)
+			require.NoError(t, err)
+
+			var deviceMetrics, podMetrics []collector.Metric
+			for _, m := range metrics[tc.counter] {
+				if _, hasPod := m.Attributes[podAttribute]; hasPod {
+					podMetrics = append(podMetrics, m)
+				} else {
+					deviceMetrics = append(deviceMetrics, m)
+				}
+			}
+
+			require.Len(t, podMetrics, tc.wantPodMetrics)
+			require.Len(t, deviceMetrics, tc.wantDeviceMetrics)
+
+			// The shared device's device-level metrics must never be attributed
+			// to any of the co-located pods: that would duplicate the device
+			// value into each pod's series.
+			var sharedDeviceMetric *collector.Metric
+			for i := range deviceMetrics {
+				m := deviceMetrics[i]
+				require.NotContains(t, m.Attributes, podAttribute)
+				require.NotContains(t, m.Attributes, namespaceAttribute)
+				require.NotContains(t, m.Attributes, containerAttribute)
+				if m.GPUUUID == "gpu-uuid-0" && sharedDeviceMetric == nil {
+					sharedDeviceMetric = &deviceMetrics[i]
+				}
+			}
+			require.NotNil(t, sharedDeviceMetric)
+			require.Equal(t, "42", sharedDeviceMetric.Value)
+
+			for i, m := range podMetrics {
+				// Per-process metrics remain attributed per pod even when the
+				// device is shared; with no NVML process data they report 0.
+				require.Equal(t, fmt.Sprintf("gpu-pod-%d", i), m.Attributes[podAttribute])
+				require.Equal(t, "default", m.Attributes[namespaceAttribute])
+				require.Equal(t, "default", m.Attributes[containerAttribute])
+				require.Equal(t, "0", m.Value)
+				require.Equal(t, "gpu-uuid-0", m.GPUUUID)
 			}
 		})
 	}
