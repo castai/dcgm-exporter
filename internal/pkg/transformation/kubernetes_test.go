@@ -3254,7 +3254,7 @@ func TestBuildPodValueMap(t *testing.T) {
 			},
 		},
 		{
-			name: "unresolved container attribution counts toward no container",
+			name: "uncertain pod's container totals are all suppressed",
 			pidToPod: map[uint32]*PodInfo{
 				1001: {UID: "uid1", Container: "ctr-a"},
 				1002: {UID: "uid1", Container: "", containerUnknown: true},
@@ -3266,7 +3266,7 @@ func TestBuildPodValueMap(t *testing.T) {
 				},
 			},
 			fieldName:       metricFBUsed,
-			expected:        map[podContainerKey]string{{UID: "uid1", Container: "ctr-a"}: "100"},
+			expected:        map[podContainerKey]string{},
 			expectedUnknown: map[string]bool{"uid1": true},
 		},
 	}

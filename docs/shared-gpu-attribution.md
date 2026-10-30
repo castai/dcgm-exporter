@@ -41,10 +41,13 @@ This is the finest identity the available telemetry supports:
   A container holding several replicas emits one measurement per device; the
   vgpu label is retained only when every mapping agrees on it.
 - When a process's owning pod is known but its container is not (unrecognized
-  cgroup layout, missing container status, or the resolved container holds no
+  cgroup layout, missing container status, or a container name that holds no
   allocation on this device), the attribution is **unknown**: the value is
-  counted toward no container, and the pod's containers on that device are
-  not reported as idle — one of them may own the unresolved process.
+  counted toward no container, and **all container totals for the pod on that
+  device are suppressed** — even positive totals, since the unresolved
+  process could belong to any of the pod's containers. A single claimant is
+  not evidence of ownership when the runtime ID positively identifies a
+  different container.
 - The downstream consumers key records by (pod, container): the kvisor GPU
   mapper builds records keyed by device, pod, namespace, container, and the
   workload-optimization reader queries `gpu_metrics` with an exact
@@ -85,8 +88,9 @@ instance-specific suppression and attribution apply per instance.
   attribution. Per-client memory remains the useful per-pod signal.
 - When a process's container cannot be resolved (unrecognized cgroup layout
   or the informer has not yet observed the container status), the value is
-  attributed to no container and the pod's containers on that device emit no
-  rows rather than fabricated zeros.
+  attributed to no container and the pod's containers on that device emit
+  no rows at all — neither positive nor zero totals — since the unresolved
+  process could belong to any of them.
 - Per-process attribution for MIG instances is limited: DRA MIG metrics carry
   MIG UUIDs while per-process data is keyed by parent UUID and GPU instance.
 - Deployment of this contract does not repair historical duplicated rows in

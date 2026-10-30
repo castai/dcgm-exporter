@@ -180,16 +180,23 @@ func resolveContainerEntry(candidates []*PodInfo, containerID string) *PodInfo {
 	if containerID != "" {
 		for _, candidate := range candidates {
 			if name, ok := candidate.containerIDs[containerID]; ok {
+				// The runtime ID positively identifies container "name".
 				for _, entry := range candidates {
 					if entry.Container == name {
 						return entry
 					}
 				}
+				// The identified container holds no allocation on this device.
+				// A single claimant does not prove that every process in the pod
+				// belongs to it: return unresolved rather than substitute.
+				return nil
 			}
 		}
+		// Unrecognized runtime ID: no evidence about ownership either way.
 	}
-	// Unambiguous fallback: a single candidate owns every process of the pod
-	// on this device.
+	// No contradictory identity evidence; a single distinct claimant is an
+	// unambiguous fallback — with one GPU-holding container, processes of
+	// the pod on this device belong to it.
 	if len(candidates) == 1 {
 		return candidates[0]
 	}

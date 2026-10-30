@@ -315,14 +315,25 @@ func (p *PodMapper) createPerProcessMetrics(
 		result = append(result, metric)
 	}
 
+	// A nil result means per-process collection was not applicable (no
+	// consumers); the caller falls back to device-level attribution. An
+	// empty non-nil result means collection was handled but every attributed
+	// row was withheld because ownership was uncertain: the caller must
+	// emit only the device-level row, never copy the device value onto a
+	// consumer whose total may be incomplete.
+	if result == nil && len(devicePods) > 0 {
+		return []collector.Metric{}, nil
+	}
+
 	return result, nil
 }
 
 // buildPodValueMap aggregates per-process values per (pod, container). It
 // also returns the set of pod UIDs that have values with unresolved container
 // attribution: those values are counted toward no container, and their
-// existence means the pod's containers on this device cannot be reported as
-// idle — one of them may own the unresolved process.
+// existence means no container total for the pod can be trusted on this
+// device — even positive totals may be incomplete, since the unresolved
+// process could belong to any of the pod's containers.
 func buildPodValueMap(pidToPod map[uint32]*PodInfo, data *perProcessMetrics, fieldName string) (map[podContainerKey]string, map[string]bool) {
 	podValues := make(map[podContainerKey]string)
 	unknownPods := make(map[string]bool)
@@ -343,6 +354,15 @@ func buildPodValueMap(pidToPod map[uint32]*PodInfo, data *perProcessMetrics, fie
 	}
 	for key, total := range podAccum {
 		podValues[key] = fmt.Sprintf("%d", total)
+	}
+	// Uncertainty invalidates every container total for the pod on this
+	// device/metric: the unresolved usage could belong to any of them, so
+	// even positive totals may be incomplete and must not be presented as
+	// complete measurements.
+	for key := range podValues {
+		if unknownPods[key.UID] {
+			delete(podValues, key)
+		}
 	}
 	return podValues, unknownPods
 }

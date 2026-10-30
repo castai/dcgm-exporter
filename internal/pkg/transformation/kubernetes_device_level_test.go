@@ -768,19 +768,51 @@ func TestCreatePerProcessMetricsAcrossDevices(t *testing.T) {
 		assertNoDuplicateSeries(t, result)
 	})
 
-	t.Run("unresolved container attribution emits no misleading zero", func(t *testing.T) {
+	// Pod P has containers A and B: PID 101 (100 MiB) is positively attributed
+	// to A, PID 102 (900 MiB) belongs to P but its container is unresolved.
+	// Emitting A = 100 MiB would present a potentially incomplete total as
+	// complete - the 900 MiB could belong to A. Pod Q is fully resolved and
+	// must keep its measurement.
+	t.Run("uncertain pod emits no container totals, fully resolved pod keeps its measurement", func(t *testing.T) {
 		t.Parallel()
-		// The pod has two GPU containers; one process resolves to ctr-a,
-		// another cannot be resolved. ctr-b must not appear as idle-zero.
+		ctrA := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "ctr-a", DynamicResources: claim("claim-a")}
+		ctrB := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "ctr-b", DynamicResources: claim("claim-b")}
+		unknown := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "", containerUnknown: true}
+		podQ := PodInfo{Name: "pod-b", Namespace: "default", UID: "uid-b", Container: "ctr", DynamicResources: claim("claim-b")}
+
+		dataMap := &perProcessDataMap{
+			metrics: map[string]*perProcessMetrics{
+				gpu0: {pidToMemory: map[uint32]uint64{101: 100 << 20, 102: 900 << 20, 201: 500 << 20}},
+			},
+			pidToPod:     map[uint32]*PodInfo{101: &ctrA, 102: &unknown, 201: &podQ},
+			deviceToPods: map[string][]PodInfo{gpu0: {ctrA, ctrB, podQ}},
+		}
+
+		result, err := newMapper().createPerProcessMetrics(
+			collector.Metric{GPUUUID: gpu0}, fbUsedCounter, fbMetric(), dataMap,
+			func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+		)
+		require.NoError(t, err)
+		require.Len(t, result, 1, "only the fully resolved pod is attributed")
+		assert.Equal(t, "pod-b", result[0].Attributes[podAttribute])
+		assert.Equal(t, "500", result[0].Value)
+		assertNoDuplicateSeries(t, result)
+	})
+
+	// A resolved container with zero measured usage next to an unresolved
+	// process in the same pod: the zero is as potentially incomplete as a
+	// positive total.
+	t.Run("resolved zero plus unresolved usage emits no misleading zero either", func(t *testing.T) {
+		t.Parallel()
 		ctrA := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "ctr-a", DynamicResources: claim("claim-a")}
 		ctrB := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "ctr-b", DynamicResources: claim("claim-b")}
 		unknown := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "", containerUnknown: true}
 
 		dataMap := &perProcessDataMap{
 			metrics: map[string]*perProcessMetrics{
-				gpu0: {pidToMemory: map[uint32]uint64{101: 100 << 20, 102: 900 << 20}},
+				gpu0: {pidToMemory: map[uint32]uint64{102: 900 << 20}},
 			},
-			pidToPod:     map[uint32]*PodInfo{101: &ctrA, 102: &unknown},
+			pidToPod:     map[uint32]*PodInfo{102: &unknown},
 			deviceToPods: map[string][]PodInfo{gpu0: {ctrA, ctrB}},
 		}
 
@@ -789,10 +821,95 @@ func TestCreatePerProcessMetricsAcrossDevices(t *testing.T) {
 			func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
 		)
 		require.NoError(t, err)
-		require.Len(t, result, 1, "only the resolved container is attributed")
-		assert.Equal(t, "ctr-a", result[0].Attributes[containerAttribute])
-		assert.Equal(t, "100", result[0].Value)
+		require.Len(t, result, 0, "no container total for the uncertain pod, not even a zero")
 		assertNoDuplicateSeries(t, result)
+	})
+
+	// When every attributed row is withheld by uncertainty, the result must
+	// be non-nil so the Process emission path emits only the device-level
+	// row instead of falling back to attributing the device value to a
+	// consumer.
+	t.Run("all-withheld process result is non-nil to prevent device-value fallback", func(t *testing.T) {
+		t.Parallel()
+		ctrA := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "ctr-a", DynamicResources: claim("claim-a")}
+		unknown := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "", containerUnknown: true}
+
+		dataMap := &perProcessDataMap{
+			metrics: map[string]*perProcessMetrics{
+				gpu0: {pidToMemory: map[uint32]uint64{102: 900 << 20}},
+			},
+			pidToPod:     map[uint32]*PodInfo{102: &unknown},
+			deviceToPods: map[string][]PodInfo{gpu0: {ctrA}},
+		}
+
+		result, err := newMapper().createPerProcessMetrics(
+			collector.Metric{GPUUUID: gpu0}, fbUsedCounter, fbMetric(), dataMap,
+			func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+		)
+		require.NoError(t, err)
+		require.NotNil(t, result, "handled-but-withheld must be non-nil, distinct from not-applicable nil")
+		require.Len(t, result, 0)
+	})
+
+	// The unknown PID's value exists only on gpu0's data; pod-a's
+	// measurement on gpu1 must remain attributed.
+	t.Run("uncertainty is scoped to the affected device", func(t *testing.T) {
+		t.Parallel()
+		consumer := func() PodInfo {
+			return PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "ctr", DynamicResources: claim("claim-a")}
+		}
+		unknown := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "", containerUnknown: true}
+
+		dataMap := &perProcessDataMap{
+			metrics: map[string]*perProcessMetrics{
+				gpu0: {pidToMemory: map[uint32]uint64{102: 900 << 20}},
+				gpu1: {pidToMemory: map[uint32]uint64{101: 200 << 20}},
+			},
+			pidToPod:     map[uint32]*PodInfo{101: ptr(consumer()), 102: &unknown},
+			deviceToPods: map[string][]PodInfo{gpu0: {consumer()}, gpu1: {consumer()}},
+		}
+
+		// gpu0: unknown usage suppresses all pod-a totals.
+		result, err := newMapper().createPerProcessMetrics(
+			collector.Metric{GPUUUID: gpu0}, fbUsedCounter, fbMetric(), dataMap,
+			func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+		)
+		require.NoError(t, err)
+		require.Len(t, result, 0, "uncertain pod total suppressed on gpu0")
+
+		// gpu1: no unknown usage keeps pod-a's measurement.
+		result, err = newMapper().createPerProcessMetrics(
+			collector.Metric{GPUUUID: gpu1}, fbUsedCounter, fbMetric(), dataMap,
+			func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+		)
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		assert.Equal(t, "200", result[0].Value)
+	})
+
+	t.Run("gpu util follows the same uncertainty rules", func(t *testing.T) {
+		t.Parallel()
+		ctrA := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "ctr-a", DynamicResources: claim("claim-a")}
+		unknown := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "", containerUnknown: true}
+		podQ := PodInfo{Name: "pod-b", Namespace: "default", UID: "uid-b", Container: "ctr", DynamicResources: claim("claim-b")}
+
+		dataMap := &perProcessDataMap{
+			metrics: map[string]*perProcessMetrics{
+				gpu0: {pidToSMUtil: map[uint32]uint32{101: 40, 102: 55, 201: 30}},
+			},
+			pidToPod:     map[uint32]*PodInfo{101: &ctrA, 102: &unknown, 201: &podQ},
+			deviceToPods: map[string][]PodInfo{gpu0: {ctrA, podQ}},
+		}
+
+		result, err := newMapper().createPerProcessMetrics(
+			collector.Metric{GPUUUID: gpu0}, gpuUtilCounter,
+			collector.Metric{GPUUUID: gpu0, Value: "0", Attributes: map[string]string{}, Labels: map[string]string{}},
+			dataMap, func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+		)
+		require.NoError(t, err)
+		require.Len(t, result, 1, "only the resolved pod keeps its utilization")
+		assert.Equal(t, "pod-b", result[0].Attributes[podAttribute])
+		assert.Equal(t, "30", result[0].Value)
 	})
 }
 
@@ -1014,6 +1131,34 @@ func TestResolveContainerEntry(t *testing.T) {
 			containerIDs: map[string]string{"id-c": "ctr-c"},
 		}
 		assert.Nil(t, resolveContainerEntry([]*PodInfo{&other, &ctrB}, "id-c"))
+	})
+
+	t.Run("known nonclaiming container with one claimant does not select that claimant", func(t *testing.T) {
+		t.Parallel()
+		// Candidate: container "app". Its pod-status map contains
+		// "sidecar-id" → "sidecar". The requested runtime ID "sidecar-id"
+		// positively identifies the container "sidecar", which holds no
+		// allocation on this device. One claiming container does not prove
+		// that every process in the pod belongs to it.
+		app := PodInfo{
+			Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "app",
+			containerIDs: map[string]string{"sidecar-id": "sidecar"},
+		}
+		assert.Nil(t, resolveContainerEntry([]*PodInfo{&app}, "sidecar-id"),
+			"the runtime ID positively identifies a nonclaiming container; the single-claimant fallback must not override that")
+	})
+
+	t.Run("missing ID with one genuinely unambiguous claimant preserves the fallback", func(t *testing.T) {
+		t.Parallel()
+		// No runtime ID evidence at all: a single distinct claimant is an
+		// unambiguous fallback.
+		got := resolveContainerEntry([]*PodInfo{&ctrA}, "")
+		require.NotNil(t, got)
+		assert.Equal(t, "ctr-a", got.Container)
+		// An unrecognized runtime ID is also no evidence against ownership.
+		got = resolveContainerEntry([]*PodInfo{&ctrA}, "id-zz")
+		require.NotNil(t, got)
+		assert.Equal(t, "ctr-a", got.Container)
 	})
 
 	t.Run("unambiguous single candidate owns every process of the pod", func(t *testing.T) {

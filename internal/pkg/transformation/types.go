@@ -87,9 +87,10 @@ type PodInfo struct {
 	// attributed per container instead of only per pod.
 	containerIDs map[string]string
 	// containerUnknown marks a PID-to-pod mapping whose owning container
-	// could not be resolved. Values of such processes must not be attributed
-	// to any container, and their existence must suppress idle zeros for the
-	// pod's containers on that device, since one of them may own the process.
+	// could not be resolved. Values of such processes are counted toward no
+	// container, and their existence suppresses all container totals for the
+	// pod on that device — even positive totals may be incomplete, since the
+	// unresolved process could belong to any of them.
 	containerUnknown bool
 }
 
