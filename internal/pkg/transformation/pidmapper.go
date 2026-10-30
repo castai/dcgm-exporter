@@ -35,10 +35,9 @@ var podUIDRegex = regexp.MustCompile(`pod([a-f0-9_-]+)`)
 var containerIDRegex = regexp.MustCompile(`(?:cri-containerd-)?([0-9a-f]{64})(?:\.scope)?$`)
 
 type pidToPodMapper struct {
-	pidToUID            map[uint32]string
-	pidToContainerID    map[uint32]string
-	podContainerWarnOne sync.Once
-	cgroupWarnOnce      sync.Once
+	pidToUID         map[uint32]string
+	pidToContainerID map[uint32]string
+	cgroupWarnOnce   sync.Once
 }
 
 func newPIDToPodMapper() *pidToPodMapper {

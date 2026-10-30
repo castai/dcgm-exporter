@@ -789,10 +789,14 @@ func TestExtractContainerID(t *testing.T) {
 func TestResolveContainerEntry(t *testing.T) {
 	t.Parallel()
 
-	ctrA := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr-a",
-		containerIDs: map[string]string{"id-a": "ctr-a"}}
-	ctrB := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr-b",
-		containerIDs: map[string]string{"id-b": "ctr-b"}}
+	ctrA := PodInfo{
+		Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr-a",
+		containerIDs: map[string]string{"id-a": "ctr-a"},
+	}
+	ctrB := PodInfo{
+		Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr-b",
+		containerIDs: map[string]string{"id-b": "ctr-b"},
+	}
 
 	t.Run("resolves the container owning the runtime id", func(t *testing.T) {
 		t.Parallel()
