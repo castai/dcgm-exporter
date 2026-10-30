@@ -275,8 +275,8 @@ func (p *PodMapper) createPerProcessMetrics(
 		return nil, nil
 	}
 	data := dataMap.metrics[metricsKey]
-	podValues := buildPodValueMap(dataMap.pidToPod, data, counter.FieldName)
-	maps.Copy(podValues, buildIdlePodValues(podValues, devicePods))
+	podValues, podsUnknown := buildPodValueMap(dataMap.pidToPod, data, counter.FieldName)
+	maps.Copy(podValues, buildIdlePodValues(podValues, devicePods, podsUnknown))
 
 	var result []collector.Metric
 	for _, podInfo := range devicePods {
@@ -318,27 +318,43 @@ func (p *PodMapper) createPerProcessMetrics(
 	return result, nil
 }
 
-func buildPodValueMap(pidToPod map[uint32]*PodInfo, data *perProcessMetrics, fieldName string) map[podContainerKey]string {
+// buildPodValueMap aggregates per-process values per (pod, container). It
+// also returns the set of pod UIDs that have values with unresolved container
+// attribution: those values are counted toward no container, and their
+// existence means the pod's containers on this device cannot be reported as
+// idle — one of them may own the unresolved process.
+func buildPodValueMap(pidToPod map[uint32]*PodInfo, data *perProcessMetrics, fieldName string) (map[podContainerKey]string, map[string]bool) {
 	podValues := make(map[podContainerKey]string)
+	unknownPods := make(map[string]bool)
 	if data == nil {
-		return podValues
+		return podValues, unknownPods
 	}
 	podAccum := make(map[podContainerKey]uint64)
 	for pid, podInfo := range pidToPod {
-		if value, ok := data.getValueForMetric(fieldName, pid); ok {
-			podAccum[podKeyFor(*podInfo)] += value
+		value, ok := data.getValueForMetric(fieldName, pid)
+		if !ok {
+			continue
 		}
+		if podInfo.containerUnknown {
+			unknownPods[podInfo.UID] = true
+			continue
+		}
+		podAccum[podKeyFor(*podInfo)] += value
 	}
 	for key, total := range podAccum {
 		podValues[key] = fmt.Sprintf("%d", total)
 	}
-	return podValues
+	return podValues, unknownPods
 }
 
-func buildIdlePodValues(existingValues map[podContainerKey]string, devicePods []PodInfo) map[podContainerKey]string {
+// buildIdlePodValues adds zero values for consumers without measured values,
+// except pods with unresolved attribution: reporting such a container as zero
+// would fabricate idleness for a container that may own an unattributed
+// process on this device.
+func buildIdlePodValues(existingValues map[podContainerKey]string, devicePods []PodInfo, podsUnknown map[string]bool) map[podContainerKey]string {
 	idleValues := make(map[podContainerKey]string)
 	for _, podInfo := range devicePods {
-		if _, ok := existingValues[podKeyFor(podInfo)]; !ok {
+		if _, ok := existingValues[podKeyFor(podInfo)]; !ok && !podsUnknown[podInfo.UID] {
 			idleValues[podKeyFor(podInfo)] = "0"
 		}
 	}

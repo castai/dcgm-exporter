@@ -3139,11 +3139,12 @@ func TestPodMapper_createPodInfo_WithInformer(t *testing.T) {
 func TestBuildPodValueMap(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name      string
-		pidToPod  map[uint32]*PodInfo
-		data      *perProcessMetrics
-		fieldName string
-		expected  map[podContainerKey]string
+		name            string
+		pidToPod        map[uint32]*PodInfo
+		data            *perProcessMetrics
+		fieldName       string
+		expected        map[podContainerKey]string
+		expectedUnknown map[string]bool
 	}{
 		{
 			name:      "nil data returns empty map",
@@ -3239,7 +3240,7 @@ func TestBuildPodValueMap(t *testing.T) {
 			},
 		},
 		{
-			name: "vgpu replicas of one container accumulate separately",
+			name: "vgpu replicas of one container accumulate together",
 			pidToPod: map[uint32]*PodInfo{
 				1001: {UID: "uid1", Container: "ctr", VGPU: "1"},
 				1002: {UID: "uid1", Container: "ctr", VGPU: "2"},
@@ -3249,17 +3250,36 @@ func TestBuildPodValueMap(t *testing.T) {
 			},
 			fieldName: metricFBUsed,
 			expected: map[podContainerKey]string{
-				{UID: "uid1", Container: "ctr", VGPU: "1"}: "100",
-				{UID: "uid1", Container: "ctr", VGPU: "2"}: "200",
+				{UID: "uid1", Container: "ctr"}: "300",
 			},
+		},
+		{
+			name: "unresolved container attribution counts toward no container",
+			pidToPod: map[uint32]*PodInfo{
+				1001: {UID: "uid1", Container: "ctr-a"},
+				1002: {UID: "uid1", Container: "", containerUnknown: true},
+			},
+			data: &perProcessMetrics{
+				pidToMemory: map[uint32]uint64{
+					1001: 100 * 1024 * 1024,
+					1002: 900 * 1024 * 1024,
+				},
+			},
+			fieldName:       metricFBUsed,
+			expected:        map[podContainerKey]string{{UID: "uid1", Container: "ctr-a"}: "100"},
+			expectedUnknown: map[string]bool{"uid1": true},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			result := buildPodValueMap(tc.pidToPod, tc.data, tc.fieldName)
+			result, unknown := buildPodValueMap(tc.pidToPod, tc.data, tc.fieldName)
 			assert.Equal(t, tc.expected, result)
+			if tc.expectedUnknown == nil {
+				tc.expectedUnknown = map[string]bool{}
+			}
+			assert.Equal(t, tc.expectedUnknown, unknown)
 		})
 	}
 }
@@ -3270,6 +3290,7 @@ func TestBuildIdlePodValues(t *testing.T) {
 		name           string
 		existingValues map[podContainerKey]string
 		devicePods     []PodInfo
+		podsUnknown    map[string]bool
 		expected       map[podContainerKey]string
 	}{
 		{
@@ -3296,12 +3317,19 @@ func TestBuildIdlePodValues(t *testing.T) {
 			devicePods:     []PodInfo{{UID: "uid1", Container: "ctr-a"}, {UID: "uid1", Container: "ctr-b"}},
 			expected:       map[podContainerKey]string{{UID: "uid1", Container: "ctr-b"}: "0"},
 		},
+		{
+			name:           "pod with unresolved attribution is not reported idle",
+			existingValues: map[podContainerKey]string{{UID: "uid1", Container: "ctr-a"}: "50"},
+			devicePods:     []PodInfo{{UID: "uid1", Container: "ctr-a"}, {UID: "uid1", Container: "ctr-b"}},
+			podsUnknown:    map[string]bool{"uid1": true},
+			expected:       map[podContainerKey]string{},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			result := buildIdlePodValues(tc.existingValues, tc.devicePods)
+			result := buildIdlePodValues(tc.existingValues, tc.devicePods, tc.podsUnknown)
 			assert.Equal(t, tc.expected, result)
 		})
 	}

@@ -144,7 +144,25 @@ func (m *pidToPodMapper) buildPIDToPodMap(pids []uint32, pods []PodInfo) map[uin
 		if !ok || len(candidates) == 0 {
 			continue
 		}
-		result[pid] = resolveContainerEntry(candidates, containerID)
+		if entry := resolveContainerEntry(candidates, containerID); entry != nil {
+			result[pid] = entry
+		} else {
+			// The owning pod is known but the container is not. Mark the
+			// attribution unknown instead of guessing: assigning the value to
+			// an arbitrary container would both fabricate that container's
+			// usage and make the real owner look idle.
+			unknown := *candidates[0]
+			unknown.Container = ""
+			unknown.VGPU = ""
+			unknown.Labels = nil
+			unknown.DynamicResources = nil
+			unknown.containerUnknown = true
+			result[pid] = &unknown
+			slog.Debug("Could not resolve process container; attribution unknown for this pod",
+				"pid", pid,
+				"containerID", containerID,
+				"pod", candidates[0].Name)
+		}
 	}
 
 	return result
@@ -152,12 +170,12 @@ func (m *pidToPodMapper) buildPIDToPodMap(pids []uint32, pods []PodInfo) map[uin
 
 // resolveContainerEntry selects the PodInfo for the container that owns the
 // process. The runtime container ID from the cgroup path is translated to a
-// container name through the pod status recorded on the entries. When the
-// container cannot be resolved (unrecognized cgroup layout, or the informer
-// has not yet observed the container status), the first entry for the pod is
-// used so the measurement is attributed to the pod rather than dropped; with
-// multiple GPU-holding containers this fallback attributes to the first one
-// and is logged for visibility.
+// container name through the pod status recorded on the entries. The single
+// candidate is an unambiguous fallback: with one GPU-holding container, any
+// process of the pod belongs to it. With several candidates and no successful
+// resolution (unrecognized cgroup layout, missing container status, or a
+// container name that holds no allocation on this device), nil is returned
+// and the caller must treat attribution as unknown rather than guess.
 func resolveContainerEntry(candidates []*PodInfo, containerID string) *PodInfo {
 	if containerID != "" {
 		for _, candidate := range candidates {
@@ -170,10 +188,10 @@ func resolveContainerEntry(candidates []*PodInfo, containerID string) *PodInfo {
 			}
 		}
 	}
-	if len(candidates) > 1 {
-		slog.Debug("Could not resolve process container; attributing to the pod's first claiming container",
-			"containerID", containerID,
-			"container", candidates[0].Container)
+	// Unambiguous fallback: a single candidate owns every process of the pod
+	// on this device.
+	if len(candidates) == 1 {
+		return candidates[0]
 	}
-	return candidates[0]
+	return nil
 }

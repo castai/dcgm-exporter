@@ -86,6 +86,11 @@ type PodInfo struct {
 	// container ID to the owning container so per-process values can be
 	// attributed per container instead of only per pod.
 	containerIDs map[string]string
+	// containerUnknown marks a PID-to-pod mapping whose owning container
+	// could not be resolved. Values of such processes must not be attributed
+	// to any container, and their existence must suppress idle zeros for the
+	// pod's containers on that device, since one of them may own the process.
+	containerUnknown bool
 }
 
 type DRAResourceSliceManager struct {

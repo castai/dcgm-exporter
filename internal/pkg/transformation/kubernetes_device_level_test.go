@@ -199,9 +199,18 @@ func runDeviceLevelScenario(t *testing.T, opts scenarioOptions) (deviceMetrics, 
 }
 
 // metricSeriesKey renders the identifying label set of a metric for duplicate
-// series detection: two metrics with the same key cannot both be exposed.
+// series detection: two metrics with the same key cannot both be exposed. It
+// includes the device identity the renderer adds as labels (GPU index, UUID,
+// device name, MIG instance) so per-instance series never collide.
 func metricSeriesKey(m collector.Metric) string {
-	pairs := make([]string, 0, len(m.Attributes)+len(m.Labels))
+	pairs := make([]string, 0, len(m.Attributes)+len(m.Labels)+6)
+	pairs = append(pairs,
+		"gpu="+m.GPU,
+		"UUID="+m.GPUUUID,
+		"device="+m.GPUDevice,
+		"instance="+m.GPUInstanceID,
+		"profile="+m.MigProfile,
+	)
 	for k, v := range m.Attributes {
 		pairs = append(pairs, k+"="+v)
 	}
@@ -622,6 +631,173 @@ func TestCreatePerProcessMetricsPerContainer(t *testing.T) {
 
 // TestSameConsumer covers the attribution identity comparison, including the
 // UID fallback semantics.
+// TestCreatePerProcessMetricsAcrossDevices covers the collector's global
+// PID-to-pod map being shared across devices: with the attribution identity
+// being (pod, container) — invariant per process — the entry resolved for a
+// later device must not corrupt an earlier device's attribution, even though
+// the devices describe the consumer with different vGPU allocations.
+func TestCreatePerProcessMetricsAcrossDevices(t *testing.T) {
+	t.Parallel()
+
+	gpu0, gpu1 := "GPU-dev-0", "GPU-dev-1"
+	claim := func(name string) *DynamicResourceInfo {
+		return &DynamicResourceInfo{
+			ClaimName: name, ClaimNamespace: "ns1",
+			DriverName: DRAGPUDriverName, PoolName: "poolA", DeviceName: "gpu-x",
+		}
+	}
+	fbMetric := func() collector.Metric {
+		return collector.Metric{Value: "0", Attributes: map[string]string{}, Labels: map[string]string{}}
+	}
+	newMapper := func() *PodMapper { return &PodMapper{Config: &appconfig.Config{}} }
+
+	// One pod container with one process using both GPUs. The sharing map
+	// describes it with VGPU=1 on GPU 0 and VGPU=2 on GPU 1; the global
+	// pidToPod holds whichever entry the last device's collection resolved.
+	consumer := func(vgpu string) PodInfo {
+		return PodInfo{
+			Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "ctr", VGPU: vgpu,
+			DynamicResources: claim("claim-a"),
+		}
+	}
+
+	t.Run("later device resolution does not zero the earlier device", func(t *testing.T) {
+		t.Parallel()
+		dataMap := &perProcessDataMap{
+			metrics: map[string]*perProcessMetrics{
+				gpu0: {pidToMemory: map[uint32]uint64{101: 1024 << 20}},
+				gpu1: {pidToMemory: map[uint32]uint64{101: 2048 << 20}},
+			},
+			pidToPod: map[uint32]*PodInfo{101: ptr(consumer("2"))}, // GPU 1 won the overwrite
+			deviceToPods: map[string][]PodInfo{
+				gpu0: {consumer("1")},
+				gpu1: {consumer("2")},
+			},
+		}
+
+		for _, tc := range []struct{ gpuUUID, vgpu, want string }{
+			{gpu0, "1", "1024"},
+			{gpu1, "2", "2048"},
+		} {
+			result, err := newMapper().createPerProcessMetrics(
+				collector.Metric{GPUUUID: tc.gpuUUID}, fbUsedCounter, fbMetric(), dataMap,
+				func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+			)
+			require.NoError(t, err)
+			require.Len(t, result, 1)
+			assert.Equal(t, tc.want, result[0].Value)
+			assert.Equal(t, "pod-a", result[0].Attributes[podAttribute])
+			assert.Equal(t, "ctr", result[0].Attributes[containerAttribute])
+			assert.Equal(t, tc.vgpu, result[0].Attributes[vgpuAttribute], "allocation label follows the device's own description")
+		}
+	})
+
+	t.Run("reversed overwrite order is equally correct", func(t *testing.T) {
+		t.Parallel()
+		dataMap := &perProcessDataMap{
+			metrics: map[string]*perProcessMetrics{
+				gpu0: {pidToMemory: map[uint32]uint64{101: 1024 << 20}},
+				gpu1: {pidToMemory: map[uint32]uint64{101: 2048 << 20}},
+			},
+			pidToPod: map[uint32]*PodInfo{101: ptr(consumer("1"))}, // GPU 0 won the overwrite
+			deviceToPods: map[string][]PodInfo{
+				gpu0: {consumer("1")},
+				gpu1: {consumer("2")},
+			},
+		}
+
+		for _, tc := range []struct{ gpuUUID, want string }{
+			{gpu0, "1024"},
+			{gpu1, "2048"},
+		} {
+			result, err := newMapper().createPerProcessMetrics(
+				collector.Metric{GPUUUID: tc.gpuUUID}, fbUsedCounter, fbMetric(), dataMap,
+				func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+			)
+			require.NoError(t, err)
+			require.Len(t, result, 1)
+			assert.Equal(t, tc.want, result[0].Value)
+		}
+	})
+
+	t.Run("multiple processes of one container accumulate per device", func(t *testing.T) {
+		t.Parallel()
+		dataMap := &perProcessDataMap{
+			metrics: map[string]*perProcessMetrics{
+				gpu0: {pidToMemory: map[uint32]uint64{101: 100 << 20, 102: 24 << 20}},
+			},
+			pidToPod: map[uint32]*PodInfo{
+				101: ptr(consumer("")),
+				102: ptr(consumer("")),
+			},
+			deviceToPods: map[string][]PodInfo{gpu0: {consumer("")}},
+		}
+
+		result, err := newMapper().createPerProcessMetrics(
+			collector.Metric{GPUUUID: gpu0}, fbUsedCounter, fbMetric(), dataMap,
+			func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+		)
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		assert.Equal(t, "124", result[0].Value)
+	})
+
+	t.Run("replica allocations of one container emit a single device measurement", func(t *testing.T) {
+		t.Parallel()
+		// The sharing map lists the container once per vGPU replica of the
+		// device; cgroups cannot distinguish which replica a process uses.
+		dataMap := &perProcessDataMap{
+			metrics: map[string]*perProcessMetrics{
+				gpu0: {pidToMemory: map[uint32]uint64{101: 100 << 20, 102: 50 << 20}},
+			},
+			pidToPod: map[uint32]*PodInfo{
+				101: ptr(consumer("1")),
+				102: ptr(consumer("2")),
+			},
+			deviceToPods: map[string][]PodInfo{gpu0: {consumer("1"), consumer("2")}},
+		}
+
+		result, err := newMapper().createPerProcessMetrics(
+			collector.Metric{GPUUUID: gpu0}, fbUsedCounter, fbMetric(), dataMap,
+			func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+		)
+		require.NoError(t, err)
+		require.Len(t, result, 1, "one series per container, not per replica")
+		assert.Equal(t, "150", result[0].Value)
+		assert.NotContains(t, result[0].Attributes, vgpuAttribute, "ambiguous replica allocation is not retained")
+		assertNoDuplicateSeries(t, result)
+	})
+
+	t.Run("unresolved container attribution emits no misleading zero", func(t *testing.T) {
+		t.Parallel()
+		// The pod has two GPU containers; one process resolves to ctr-a,
+		// another cannot be resolved. ctr-b must not appear as idle-zero.
+		ctrA := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "ctr-a", DynamicResources: claim("claim-a")}
+		ctrB := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "ctr-b", DynamicResources: claim("claim-b")}
+		unknown := PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-a", Container: "", containerUnknown: true}
+
+		dataMap := &perProcessDataMap{
+			metrics: map[string]*perProcessMetrics{
+				gpu0: {pidToMemory: map[uint32]uint64{101: 100 << 20, 102: 900 << 20}},
+			},
+			pidToPod:     map[uint32]*PodInfo{101: &ctrA, 102: &unknown},
+			deviceToPods: map[string][]PodInfo{gpu0: {ctrA, ctrB}},
+		}
+
+		result, err := newMapper().createPerProcessMetrics(
+			collector.Metric{GPUUUID: gpu0}, fbUsedCounter, fbMetric(), dataMap,
+			func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+		)
+		require.NoError(t, err)
+		require.Len(t, result, 1, "only the resolved container is attributed")
+		assert.Equal(t, "ctr-a", result[0].Attributes[containerAttribute])
+		assert.Equal(t, "100", result[0].Value)
+		assertNoDuplicateSeries(t, result)
+	})
+}
+
+func ptr(p PodInfo) *PodInfo { return &p }
+
 func TestSameConsumer(t *testing.T) {
 	t.Parallel()
 
@@ -639,10 +815,10 @@ func TestSameConsumer(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "same pod and container, different vgpu allocation",
+			name: "same pod and container across different vgpu allocations",
 			a:    base,
 			b:    PodInfo{Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr", VGPU: "2"},
-			want: false,
+			want: true,
 		},
 		{
 			name: "unpopulated UIDs fall back to namespace and name",
@@ -684,32 +860,40 @@ func TestDistinctPodConsumers(t *testing.T) {
 	tests := []struct {
 		name string
 		pods []PodInfo
-		want []string // container names of retained entries, in order
+		want []PodInfo // retained consumers with their (possibly cleared) VGPU
 	}{
-		{name: "nil", pods: nil, want: []string{}},
-		{name: "single", pods: []PodInfo{pod("ctr")}, want: []string{"ctr"}},
+		{name: "nil", pods: nil, want: []PodInfo{}},
+		{name: "single", pods: []PodInfo{pod("ctr")}, want: []PodInfo{pod("ctr")}},
 		{
 			name: "repeated identical entries collapse",
 			pods: []PodInfo{pod("ctr"), pod("ctr"), pod("ctr")},
-			want: []string{"ctr"},
+			want: []PodInfo{pod("ctr")},
 		},
 		{
 			name: "containers of one pod stay distinct",
 			pods: []PodInfo{pod("ctr-a"), pod("ctr-b")},
-			want: []string{"ctr-a", "ctr-b"},
+			want: []PodInfo{pod("ctr-a"), pod("ctr-b")},
 		},
 		{
-			name: "vgpu replicas of one container stay distinct",
+			name: "vgpu replicas of one container merge to one consumer with cleared allocation",
 			pods: []PodInfo{
 				{Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr", VGPU: "1"},
 				{Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr", VGPU: "2"},
 			},
-			want: []string{"ctr", "ctr"},
+			want: []PodInfo{{Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr", VGPU: ""}},
+		},
+		{
+			name: "agreeing vgpu allocations are retained",
+			pods: []PodInfo{
+				{Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr", VGPU: "1"},
+				{Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr", VGPU: "1"},
+			},
+			want: []PodInfo{{Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr", VGPU: "1"}},
 		},
 		{
 			name: "different pods stay distinct",
 			pods: []PodInfo{pod("ctr"), {Name: "pod-b", Namespace: "default", UID: "uid-2", Container: "ctr"}},
-			want: []string{"ctr", "ctr"},
+			want: []PodInfo{pod("ctr"), {Name: "pod-b", Namespace: "default", UID: "uid-2", Container: "ctr"}},
 		},
 	}
 
@@ -717,11 +901,7 @@ func TestDistinctPodConsumers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := distinctPodConsumers(tc.pods)
-			containers := make([]string, 0, len(got))
-			for _, podInfo := range got {
-				containers = append(containers, podInfo.Container)
-			}
-			assert.Equal(t, tc.want, containers)
+			assert.Equal(t, tc.want, got)
 		})
 	}
 }
@@ -784,8 +964,10 @@ func TestExtractContainerID(t *testing.T) {
 	}
 }
 
-// TestResolveContainerEntry covers PID-to-container resolution against the pod
-// status mapping, including the fallback behavior.
+// TestResolveContainerEntry covers PID-to-container resolution against the
+// pod status mapping: resolution through the runtime ID, the unambiguous
+// single-candidate fallback, and unknown attribution when several candidates
+// cannot be distinguished.
 func TestResolveContainerEntry(t *testing.T) {
 	t.Parallel()
 
@@ -805,14 +987,36 @@ func TestResolveContainerEntry(t *testing.T) {
 		assert.Equal(t, "ctr-b", got.Container)
 	})
 
-	t.Run("falls back to the first claiming container when unresolved", func(t *testing.T) {
+	t.Run("resolution is independent of candidate order", func(t *testing.T) {
 		t.Parallel()
-		got := resolveContainerEntry([]*PodInfo{&ctrA, &ctrB}, "")
-		require.NotNil(t, got)
-		assert.Equal(t, "ctr-a", got.Container)
+		forward := resolveContainerEntry([]*PodInfo{&ctrA, &ctrB}, "id-a")
+		reverse := resolveContainerEntry([]*PodInfo{&ctrB, &ctrA}, "id-a")
+		require.NotNil(t, forward)
+		require.NotNil(t, reverse)
+		assert.Equal(t, "ctr-a", forward.Container)
+		assert.Equal(t, "ctr-a", reverse.Container)
 	})
 
-	t.Run("unambiguous single container", func(t *testing.T) {
+	t.Run("unresolved container with several candidates is unknown", func(t *testing.T) {
+		t.Parallel()
+		// No runtime ID available (missing container status / cgroup layout).
+		assert.Nil(t, resolveContainerEntry([]*PodInfo{&ctrA, &ctrB}, ""))
+		// Runtime ID not present in the observed pod status.
+		assert.Nil(t, resolveContainerEntry([]*PodInfo{&ctrA, &ctrB}, "id-zz"))
+	})
+
+	t.Run("resolved container holds no allocation on this device", func(t *testing.T) {
+		t.Parallel()
+		// The pod status knows container ctr-c, but only ctr-a and ctr-b hold
+		// this device: the process belongs to neither of them.
+		other := PodInfo{
+			Name: "pod-a", Namespace: "default", UID: "uid-1", Container: "ctr-a",
+			containerIDs: map[string]string{"id-c": "ctr-c"},
+		}
+		assert.Nil(t, resolveContainerEntry([]*PodInfo{&other, &ctrB}, "id-c"))
+	})
+
+	t.Run("unambiguous single candidate owns every process of the pod", func(t *testing.T) {
 		t.Parallel()
 		got := resolveContainerEntry([]*PodInfo{&ctrA}, "id-zz")
 		require.NotNil(t, got)
@@ -823,10 +1027,10 @@ func TestResolveContainerEntry(t *testing.T) {
 // TestSharedMIGInstanceAttribution covers MIG topology: a GPU instance shared
 // by two pods is emitted once without attribution, while a separate instance
 // on the same GPU keeps its sole consumer's attribution. Consumers of
-// different instances never merge. Per-process attribution on MIG instances is
-// not asserted: the DRA MIG metrics carry MIG UUIDs while per-process data is
-// keyed by parent UUID and GPU instance, so the per-process path returns no
-// data for them (pre-existing upstream behavior).
+// different instances never merge. Metrics carry the production MIG
+// representation — parent GPU UUID plus GPUInstanceID — which is what the
+// collector assigns and the per-process lookup keys on (parent UUID +
+// instance in getMIGMetricsKey).
 func TestSharedMIGInstanceAttribution(t *testing.T) {
 	testutils.RequireLinux(t)
 
@@ -932,11 +1136,11 @@ func TestSharedMIGInstanceAttribution(t *testing.T) {
 	metrics := collector.MetricsByCounter{
 		smActiveCounter: {
 			{
-				GPU: "0", GPUUUID: migShared, GPUInstanceID: "3", MigProfile: "1g.10gb",
+				GPU: "0", GPUUUID: parentUUID, GPUInstanceID: "3", MigProfile: "1g.10gb",
 				Value: "0.77", Counter: smActiveCounter, Attributes: map[string]string{}, Labels: map[string]string{},
 			},
 			{
-				GPU: "0", GPUUUID: migSolo, GPUInstanceID: "4", MigProfile: "1g.10gb",
+				GPU: "0", GPUUUID: parentUUID, GPUInstanceID: "4", MigProfile: "1g.10gb",
 				Value: "0.31", Counter: smActiveCounter, Attributes: map[string]string{}, Labels: map[string]string{},
 			},
 		},
@@ -959,20 +1163,99 @@ func TestSharedMIGInstanceAttribution(t *testing.T) {
 	require.NotNil(t, sharedRow, "shared MIG instance row missing")
 	require.NotNil(t, soloRow, "solo MIG instance row missing")
 
-	// The shared instance is emitted once, unattributed, with MIG identity kept.
+	// The shared instance is emitted once, unattributed, with device and MIG
+	// identity kept.
 	assert.Equal(t, "0.77", sharedRow.Value)
 	assert.NotContains(t, sharedRow.Attributes, podAttribute)
 	assert.NotContains(t, sharedRow.Attributes, namespaceAttribute)
 	assert.NotContains(t, sharedRow.Attributes, containerAttribute)
 	assert.NotContains(t, sharedRow.Attributes, uidAttribute)
 	assert.NotContains(t, sharedRow.Attributes, draClaimName)
-	assert.Equal(t, migShared, sharedRow.GPUUUID)
+	assert.Equal(t, parentUUID, sharedRow.GPUUUID)
+	assert.Equal(t, "3", sharedRow.GPUInstanceID)
 
 	// The separate instance keeps its sole consumer's attribution.
 	assert.Equal(t, "0.31", soloRow.Value)
 	assert.Equal(t, "pod-c", soloRow.Attributes[podAttribute])
 	assert.Equal(t, "uid-pod-c", soloRow.Attributes[uidAttribute])
 	assert.Equal(t, "claim-gpu-mig-solo", soloRow.Attributes[draClaimName])
+	assert.Equal(t, "4", soloRow.GPUInstanceID)
+}
+
+// TestMIGInstancePerProcessAttribution covers nonzero per-process memory on
+// MIG instances using the production collector representation: per-device data
+// is keyed by parent GPU UUID plus GPU instance, and the shared instance's
+// two consumers each receive their own measured value with DRA metadata while
+// the sibling instance stays isolated.
+func TestMIGInstancePerProcessAttribution(t *testing.T) {
+	t.Parallel()
+
+	parentUUID := "GPU-mig-parent-0"
+	sharedKey := getMIGMetricsKey(parentUUID, "3")
+	soloKey := getMIGMetricsKey(parentUUID, "4")
+
+	claim := func(name string) *DynamicResourceInfo {
+		return &DynamicResourceInfo{
+			ClaimName: name, ClaimNamespace: "gpu-test",
+			DriverName: DRAGPUDriverName, PoolName: "poolA", DeviceName: name,
+		}
+	}
+	podA := PodInfo{Name: "pod-a", Namespace: "gpu-test", UID: "uid-a", Container: "ctr", DynamicResources: claim("gpu-mig-shared")}
+	podB := PodInfo{Name: "pod-b", Namespace: "gpu-test", UID: "uid-b", Container: "ctr", DynamicResources: claim("gpu-mig-shared")}
+	podC := PodInfo{Name: "pod-c", Namespace: "gpu-test", UID: "uid-c", Container: "ctr", DynamicResources: claim("gpu-mig-solo")}
+
+	dataMap := &perProcessDataMap{
+		metrics: map[string]*perProcessMetrics{
+			sharedKey: {pidToMemory: map[uint32]uint64{101: 2048 << 20, 102: 3072 << 20}},
+			soloKey:   {pidToMemory: map[uint32]uint64{201: 1536 << 20}},
+		},
+		pidToPod: map[uint32]*PodInfo{101: &podA, 102: &podB, 201: &podC},
+		deviceToPods: map[string][]PodInfo{
+			sharedKey: {podA, podB},
+			soloKey:   {podC},
+		},
+	}
+
+	newMapper := func() *PodMapper { return &PodMapper{Config: &appconfig.Config{}} }
+	fbMetric := func(instance string) collector.Metric {
+		return collector.Metric{
+			GPU: "0", GPUUUID: parentUUID, GPUInstanceID: instance, MigProfile: "1g.10gb",
+			Value: "0", Attributes: map[string]string{}, Labels: map[string]string{},
+		}
+	}
+	migMetric := func(instance string) collector.Metric {
+		return collector.Metric{GPU: "0", GPUUUID: parentUUID, GPUInstanceID: instance, MigProfile: "1g.10gb"}
+	}
+
+	// Shared instance: each consumer receives its own measured value.
+	result, err := newMapper().createPerProcessMetrics(
+		migMetric("3"), fbUsedCounter, fbMetric("3"), dataMap,
+		func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+	)
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+
+	byPod := map[string]string{}
+	claims := map[string]string{}
+	for _, m := range result {
+		byPod[m.Attributes[podAttribute]] = m.Value
+		claims[m.Attributes[podAttribute]] = m.Attributes[draClaimName]
+	}
+	assert.Equal(t, map[string]string{"pod-a": "2048", "pod-b": "3072"}, byPod)
+	assert.Equal(t, map[string]string{"pod-a": "gpu-mig-shared", "pod-b": "gpu-mig-shared"}, claims)
+	assertNoDuplicateSeries(t, result)
+
+	// Sibling instance: isolated, its own consumer and value.
+	result, err = newMapper().createPerProcessMetrics(
+		migMetric("4"), fbUsedCounter, fbMetric("4"), dataMap,
+		func() dcgm.Field_Entity_Group { return dcgm.FE_GPU },
+	)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assert.Equal(t, "pod-c", result[0].Attributes[podAttribute])
+	assert.Equal(t, "1536", result[0].Value)
+	assert.Equal(t, "gpu-mig-solo", result[0].Attributes[draClaimName])
+	assert.Equal(t, "4", result[0].GPUInstanceID)
 }
 
 // TestContainerIDNameMap covers runtime container ID references from the pod

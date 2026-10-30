@@ -30,13 +30,21 @@ workloads back to exclusive GPUs.
 
 ## The attribution boundary
 
-The attribution identity is the **pod container allocation**: one (pod,
-container, vGPU) triple. This is the finest identity the available telemetry
-supports:
+The attribution identity is the **pod container**: one (pod, container) pair.
+This is the finest identity the available telemetry supports:
 
 - Process identity is resolvable to a pod UID and a runtime container ID via
   the process cgroup path; the container ID maps to a container name through
-  the pod status. Per-process values are aggregated per container.
+  the pod status. Per-process values are aggregated per container per device.
+- The vGPU allocation is **not** part of the identity: cgroups identify the
+  container, not which virtual replica of a physical GPU its processes use.
+  A container holding several replicas emits one measurement per device; the
+  vgpu label is retained only when every mapping agrees on it.
+- When a process's owning pod is known but its container is not (unrecognized
+  cgroup layout, missing container status, or the resolved container holds no
+  allocation on this device), the attribution is **unknown**: the value is
+  counted toward no container, and the pod's containers on that device are
+  not reported as idle — one of them may own the unresolved process.
 - The downstream consumers key records by (pod, container): the kvisor GPU
   mapper builds records keyed by device, pod, namespace, container, and the
   workload-optimization reader queries `gpu_metrics` with an exact
@@ -76,8 +84,9 @@ instance-specific suppression and attribution apply per instance.
 - Under MPS, per-pod `GPU_UTIL` reads zero: the MPS server owns the compute
   attribution. Per-client memory remains the useful per-pod signal.
 - When a process's container cannot be resolved (unrecognized cgroup layout
-  or the informer has not yet observed the container status), its value is
-  attributed to the pod's first claiming container rather than dropped.
+  or the informer has not yet observed the container status), the value is
+  attributed to no container and the pod's containers on that device emit no
+  rows rather than fabricated zeros.
 - Per-process attribution for MIG instances is limited: DRA MIG metrics carry
   MIG UUIDs while per-process data is keyed by parent UUID and GPU instance.
 - Deployment of this contract does not repair historical duplicated rows in

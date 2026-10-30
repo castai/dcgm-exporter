@@ -230,36 +230,47 @@ func samePod(a, b PodInfo) bool {
 }
 
 // sameConsumer reports whether two entries describe the same pod container
-// allocation: same pod (samePod) with the same container name and virtual-GPU
-// allocation. This is the attribution identity: per-process values are
-// aggregated per (pod, container, vgpu), and a device-level value can only be
-// attributed when exactly one such consumer holds the device.
+// allocation: same pod (samePod) with the same container name. This is the
+// attribution identity: process ownership is observable per (pod, container)
+// through cgroups, and per-process values are aggregated per container. The
+// vGPU allocation is NOT part of the identity — cgroups identify the
+// container, not which virtual replica of a physical GPU its processes use —
+// and is retained only as emission metadata when unambiguous.
 func sameConsumer(a, b PodInfo) bool {
-	return samePod(a, b) && a.Container == b.Container && a.VGPU == b.VGPU
+	return samePod(a, b) && a.Container == b.Container
 }
 
 // podContainerKey identifies the emitting series for a per-process value.
+// It deliberately excludes the vGPU allocation: a process's ownership is
+// invariant per (pod, container), and the collector resolves each device's
+// processes independently, so including device-specific allocation metadata
+// here would let one device's resolution overwrite another's.
 type podContainerKey struct {
 	UID       string
 	Container string
-	VGPU      string
 }
 
 func podKeyFor(podInfo PodInfo) podContainerKey {
-	return podContainerKey{UID: podInfo.UID, Container: podInfo.Container, VGPU: podInfo.VGPU}
+	return podContainerKey{UID: podInfo.UID, Container: podInfo.Container}
 }
 
 // distinctPodConsumers returns one entry per distinct pod container
 // allocation holding a device, compared via sameConsumer. Repeated mappings
 // of the same consumer (for example a pod described through both the device
-// plugin and a DRA claim, or multiple DRA slices) collapse to a single entry
-// so each consumer's series is emitted exactly once.
+// plugin and a DRA claim, or multiple vGPU replicas of one GPU) collapse to a
+// single entry so each consumer's series is emitted exactly once. The vGPU
+// allocation label is retained only when every merged entry agrees on it;
+// conflicting allocations (a container holding several replicas) emit without
+// it, since the per-process data cannot distinguish replicas.
 func distinctPodConsumers(podInfos []PodInfo) []PodInfo {
 	consumers := make([]PodInfo, 0, len(podInfos))
 	for _, podInfo := range podInfos {
 		duplicate := false
-		for _, existing := range consumers {
-			if sameConsumer(podInfo, existing) {
+		for i := range consumers {
+			if sameConsumer(podInfo, consumers[i]) {
+				if consumers[i].VGPU != podInfo.VGPU {
+					consumers[i].VGPU = ""
+				}
 				duplicate = true
 				break
 			}
