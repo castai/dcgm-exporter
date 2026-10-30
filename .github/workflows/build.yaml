@@ -28,7 +28,7 @@ jobs:
           echo "DCGM_VERSION=$(grep '^DCGM_VERSION=' hack/versions.env | cut -d= -f2)" >> $GITHUB_ENV
 
       - name: Create hermetic build directories
-        run: mkdir -p .go/compiler .go/pkg/mod
+        run: mkdir -p .go/compiler .go/pkg/mod .workspace
 
       - name: Get release tag
         if: github.event_name == 'release'
